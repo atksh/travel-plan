@@ -1,4 +1,4 @@
-"""Google Places (New) and Routes API clients."""
+"""Google Places and Routes API helpers for the generalized planner."""
 
 from __future__ import annotations
 
@@ -28,6 +28,159 @@ def _assert_api_key_configured() -> None:
         )
 
 
+def _field_mask(fields: list[str]) -> str:
+    return ",".join(fields)
+
+
+def _normalize_provider_place(place: dict[str, Any]) -> dict[str, Any]:
+    place_id = place.get("id")
+    display_name = (place.get("displayName") or {}).get("text")
+    location = place.get("location") or {}
+    lat = location.get("latitude")
+    lng = location.get("longitude")
+    if not isinstance(place_id, str):
+        raise DependencyError("GOOGLE_RESPONSE_INVALID", "Place id is missing.")
+    if not isinstance(display_name, str) or not display_name.strip():
+        raise DependencyError(
+            "GOOGLE_RESPONSE_INVALID",
+            "Place displayName.text is missing.",
+            details={"place_id": place_id},
+        )
+    if not isinstance(lat, (int, float)) or not isinstance(lng, (int, float)):
+        raise DependencyError(
+            "GOOGLE_RESPONSE_INVALID",
+            "Place location is missing.",
+            details={"place_id": place_id},
+        )
+    primary_type = place.get("primaryType")
+    rating = place.get("rating")
+    price_level = place.get("priceLevel")
+    return {
+        "provider": "google_places",
+        "provider_place_id": place_id.removeprefix("places/"),
+        "name": display_name.strip(),
+        "lat": float(lat),
+        "lng": float(lng),
+        "primary_type": primary_type if isinstance(primary_type, str) else None,
+        "rating": float(rating) if isinstance(rating, (int, float)) else None,
+        "price_level": price_level if isinstance(price_level, str) else None,
+    }
+
+
+async def search_places_text(query: str, region: str = "jp") -> list[dict[str, Any]]:
+    _assert_api_key_configured()
+    url = "https://places.googleapis.com/v1/places:searchText"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": settings.google_maps_api_key,
+        "X-Goog-FieldMask": _field_mask(
+            [
+                "places.id",
+                "places.displayName",
+                "places.location",
+                "places.primaryType",
+                "places.rating",
+                "places.priceLevel",
+            ]
+        ),
+    }
+    body = {"textQuery": query, "regionCode": region}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        payload = response.json()
+    places = payload.get("places")
+    if not isinstance(places, list):
+        raise DependencyError("GOOGLE_RESPONSE_INVALID", "Places text search payload is invalid.")
+    return [_normalize_provider_place(place) for place in places]
+
+
+async def search_places_area(
+    *,
+    center_lat: float,
+    center_lng: float,
+    radius_m: int,
+    included_types: list[str] | None = None,
+) -> list[dict[str, Any]]:
+    _assert_api_key_configured()
+    url = "https://places.googleapis.com/v1/places:searchNearby"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": settings.google_maps_api_key,
+        "X-Goog-FieldMask": _field_mask(
+            [
+                "places.id",
+                "places.displayName",
+                "places.location",
+                "places.primaryType",
+                "places.rating",
+                "places.priceLevel",
+            ]
+        ),
+    }
+    body: dict[str, Any] = {
+        "maxResultCount": 20,
+        "locationRestriction": {
+            "circle": {
+                "center": {"latitude": center_lat, "longitude": center_lng},
+                "radius": float(radius_m),
+            }
+        },
+    }
+    if included_types:
+        body["includedTypes"] = included_types
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        payload = response.json()
+    places = payload.get("places")
+    if not isinstance(places, list):
+        raise DependencyError("GOOGLE_RESPONSE_INVALID", "Places nearby search payload is invalid.")
+    return [_normalize_provider_place(place) for place in places]
+
+
+async def get_place_details(
+    provider_place_id: str,
+    *,
+    language_code: str = "ja",
+    region_code: str = "JP",
+) -> dict[str, Any]:
+    _assert_api_key_configured()
+    normalized = provider_place_id.removeprefix("places/")
+    url = f"https://places.googleapis.com/v1/places/{normalized}"
+    headers = {
+        "Content-Type": "application/json",
+        "X-Goog-Api-Key": settings.google_maps_api_key,
+        "X-Goog-FieldMask": _field_mask(
+            [
+                "id",
+                "displayName",
+                "location",
+                "regularOpeningHours",
+                "businessStatus",
+                "rating",
+                "priceLevel",
+                "primaryType",
+                "websiteUri",
+            ]
+        ),
+    }
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(
+            url,
+            headers=headers,
+            params={"languageCode": language_code, "regionCode": region_code},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    normalized_place = _normalize_provider_place(payload)
+    normalized_place["business_status"] = payload.get("businessStatus")
+    normalized_place["website_uri"] = payload.get("websiteUri")
+    normalized_place["opening_hours"] = payload.get("regularOpeningHours") or {}
+    normalized_place["raw_payload"] = payload
+    return normalized_place
+
+
 def _require_future_departure_time_iso(departure_time_iso: str | None) -> str:
     if departure_time_iso is None:
         raise RequestContractError(
@@ -48,8 +201,7 @@ def _require_future_departure_time_iso(departure_time_iso: str | None) -> str:
             "departure_time_iso must include timezone information.",
             details={"departure_time_iso": departure_time_iso},
         )
-    now = datetime.now(timezone.utc)
-    if departure_time.astimezone(timezone.utc) <= now:
+    if departure_time.astimezone(timezone.utc) <= datetime.now(timezone.utc):
         raise RequestContractError(
             "DEPARTURE_TIME_IN_PAST",
             "departure_time_iso must be in the future.",
@@ -66,109 +218,8 @@ def _parse_duration_seconds(duration: Any, *, field_name: str) -> int:
     raise DependencyError(
         "GOOGLE_RESPONSE_INVALID",
         f"Google response field '{field_name}' had an invalid duration shape.",
-        details={"field_name": field_name, "duration": duration},
+        details={"field_name": field_name},
     )
-
-
-async def search_places_text(query: str, region: str = "jp") -> list[dict[str, Any]]:
-    """Places API (New) text search — returns simplified dicts."""
-    _assert_api_key_configured()
-    url = "https://places.googleapis.com/v1/places:searchText"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": settings.google_maps_api_key,
-        "X-Goog-FieldMask": "places.id,places.displayName,places.location,places.primaryType",
-    }
-    body = {"textQuery": query, "regionCode": region}
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(url, headers=headers, json=body)
-        r.raise_for_status()
-        data = r.json()
-    out: list[dict[str, Any]] = []
-    for p in data.get("places", []):
-        place_id = p.get("id")
-        display_name = p.get("displayName")
-        location = p.get("location")
-        primary_type = p.get("primaryType")
-        if not isinstance(place_id, str):
-            raise DependencyError(
-                "GOOGLE_RESPONSE_INVALID",
-                "Places search returned a place without a valid id.",
-            )
-        if not (
-            isinstance(display_name, dict)
-            and isinstance(display_name.get("text"), str)
-        ):
-            raise DependencyError(
-                "GOOGLE_RESPONSE_INVALID",
-                "Places search returned a place without displayName.text.",
-                details={"place_id": place_id},
-            )
-        if not (
-            isinstance(location, dict)
-            and isinstance(location.get("latitude"), (int, float))
-            and isinstance(location.get("longitude"), (int, float))
-        ):
-            raise DependencyError(
-                "GOOGLE_RESPONSE_INVALID",
-                "Places search returned a place without valid location.",
-                details={"place_id": place_id},
-            )
-        if not isinstance(primary_type, str):
-            raise DependencyError(
-                "GOOGLE_RESPONSE_INVALID",
-                "Places search returned a place without primaryType.",
-                details={"place_id": place_id},
-            )
-        out.append(
-            {
-                "place_id": place_id,
-                "displayName": display_name,
-                "location": location,
-                "primaryType": primary_type,
-            }
-        )
-    return out
-
-
-async def get_place_details(
-    place_id: str,
-    *,
-    language_code: str = "ja",
-    region_code: str = "JP",
-) -> dict[str, Any]:
-    """Place Details (New) using the official GET /v1/places/{placeId} endpoint."""
-    normalized_place_id = place_id.removeprefix("places/")
-    _assert_api_key_configured()
-
-    url = f"https://places.googleapis.com/v1/places/{normalized_place_id}"
-    headers = {
-        "Content-Type": "application/json",
-        "X-Goog-Api-Key": settings.google_maps_api_key,
-        "X-Goog-FieldMask": ",".join(
-            [
-                "id",
-                "name",
-                "displayName",
-                "location",
-                "regularOpeningHours",
-                "businessStatus",
-                "rating",
-                "userRatingCount",
-                "priceLevel",
-                "primaryType",
-                "websiteUri",
-            ]
-        ),
-    }
-    params = {
-        "languageCode": language_code,
-        "regionCode": region_code,
-    }
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(url, headers=headers, params=params)
-        response.raise_for_status()
-        return response.json()
 
 
 async def compute_route_matrix_minutes(
@@ -179,71 +230,52 @@ async def compute_route_matrix_minutes(
     departure_time_iso: str | None = None,
     routing_preference: str | None = None,
 ) -> list[list[int]]:
-    """
-    Routes API computeRouteMatrix — returns duration minutes matrix.
-    Single departure time per request (API constraint).
-    """
-    n_o = len(origins)
-    n_d = len(destinations)
+    del departure_bucket
     _assert_api_key_configured()
-
-    # Routes API v2 computeRouteMatrix
     url = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": settings.google_maps_api_key,
         "X-Goog-FieldMask": "originIndex,destinationIndex,duration,distanceMeters",
     }
-    effective_routing_preference = routing_preference or (
+    effective_preference = routing_preference or (
         "TRAFFIC_AWARE" if traffic_aware else "TRAFFIC_UNAWARE"
     )
     body: dict[str, Any] = {
         "origins": [
-            {"waypoint": {"location": {"latLng": {"latitude": la, "longitude": ln}}}}
-            for la, ln in origins
+            {"waypoint": {"location": {"latLng": {"latitude": lat, "longitude": lng}}}}
+            for lat, lng in origins
         ],
         "destinations": [
-            {"waypoint": {"location": {"latLng": {"latitude": la, "longitude": ln}}}}
-            for la, ln in destinations
+            {"waypoint": {"location": {"latLng": {"latitude": lat, "longitude": lng}}}}
+            for lat, lng in destinations
         ],
         "travelMode": "DRIVE",
-        "routingPreference": effective_routing_preference,
+        "routingPreference": effective_preference,
     }
-    if effective_routing_preference != "TRAFFIC_UNAWARE":
+    if effective_preference != "TRAFFIC_UNAWARE":
         body["departureTime"] = _require_future_departure_time_iso(departure_time_iso)
     async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(url, headers=headers, json=body)
-        r.raise_for_status()
-        rows = r.json()
-    # Response is stream of RouteMatrixElement
+        response = await client.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        rows = response.json()
     if not isinstance(rows, list):
-        raise DependencyError(
-            "GOOGLE_RESPONSE_INVALID",
-            "computeRouteMatrix returned an invalid payload shape.",
-        )
-    matrix = [[0] * n_d for _ in range(n_o)]
-    for el in rows:
-        if not isinstance(el, dict):
-            raise DependencyError(
-                "GOOGLE_RESPONSE_INVALID",
-                "computeRouteMatrix returned a non-object element.",
-            )
-        origin_index = el.get("originIndex")
-        destination_index = el.get("destinationIndex")
+        raise DependencyError("GOOGLE_RESPONSE_INVALID", "Route matrix payload is invalid.")
+    matrix = [[0 for _ in destinations] for _ in origins]
+    for row in rows:
+        if not isinstance(row, dict):
+            raise DependencyError("GOOGLE_RESPONSE_INVALID", "Route matrix row is invalid.")
+        origin_index = row.get("originIndex")
+        destination_index = row.get("destinationIndex")
         if not isinstance(origin_index, int) or not isinstance(destination_index, int):
             raise DependencyError(
                 "GOOGLE_RESPONSE_INVALID",
-                "computeRouteMatrix element is missing originIndex or destinationIndex.",
-                details={"element": el},
+                "Route matrix row is missing indices.",
             )
-        if not (0 <= origin_index < n_o and 0 <= destination_index < n_d):
-            raise DependencyError(
-                "GOOGLE_RESPONSE_INVALID",
-                "computeRouteMatrix returned out-of-range indices.",
-                details={"element": el},
-            )
-        seconds = _parse_duration_seconds(el.get("duration"), field_name="duration")
-        matrix[origin_index][destination_index] = max(1, seconds // 60)
+        matrix[origin_index][destination_index] = max(
+            1,
+            _parse_duration_seconds(row.get("duration"), field_name="duration") // 60,
+        )
     return matrix
 
 
@@ -253,7 +285,6 @@ async def compute_route_polyline(
     departure_time_iso: str | None = None,
     routing_preference: str = "TRAFFIC_AWARE",
 ) -> RouteLegDetails:
-    """computeRoutes for one leg — polyline + duration."""
     _assert_api_key_configured()
     url = "https://routes.googleapis.com/directions/v2:computeRoutes"
     headers = {
@@ -261,7 +292,7 @@ async def compute_route_polyline(
         "X-Goog-Api-Key": settings.google_maps_api_key,
         "X-Goog-FieldMask": "routes.duration,routes.distanceMeters,routes.polyline",
     }
-    body = {
+    body: dict[str, Any] = {
         "origin": {"location": {"latLng": {"latitude": origin[0], "longitude": origin[1]}}},
         "destination": {
             "location": {"latLng": {"latitude": destination[0], "longitude": destination[1]}}
@@ -272,42 +303,24 @@ async def compute_route_polyline(
     if routing_preference != "TRAFFIC_UNAWARE":
         body["departureTime"] = _require_future_departure_time_iso(departure_time_iso)
     async with httpx.AsyncClient(timeout=60.0) as client:
-        r = await client.post(url, headers=headers, json=body)
-        r.raise_for_status()
-        data = r.json()
-    routes = data.get("routes", [])
-    if not routes:
-        raise DependencyError(
-            "GOOGLE_RESPONSE_INVALID",
-            "computeRoutes returned no routes.",
-            details={"origin": origin, "destination": destination},
-        )
-    route0 = routes[0]
-    if not isinstance(route0, dict):
-        raise DependencyError(
-            "GOOGLE_RESPONSE_INVALID",
-            "computeRoutes returned an invalid route payload.",
-        )
-    dur = route0.get("duration")
-    polyline = route0.get("polyline")
-    if not isinstance(polyline, dict) or not isinstance(
-        polyline.get("encodedPolyline"), str
-    ):
-        raise DependencyError(
-            "GOOGLE_RESPONSE_INVALID",
-            "computeRoutes returned a route without encoded polyline.",
-            details={"route": route0},
-        )
-    seconds = _parse_duration_seconds(dur, field_name="duration")
-    distance_meters = route0.get("distanceMeters")
+        response = await client.post(url, headers=headers, json=body)
+        response.raise_for_status()
+        payload = response.json()
+    routes = payload.get("routes")
+    if not isinstance(routes, list) or not routes:
+        raise DependencyError("GOOGLE_RESPONSE_INVALID", "No routes were returned.")
+    first = routes[0]
+    polyline = (first.get("polyline") or {}).get("encodedPolyline")
+    if not isinstance(polyline, str) or not polyline:
+        raise DependencyError("GOOGLE_RESPONSE_INVALID", "Route polyline is missing.")
+    distance_meters = first.get("distanceMeters")
     if distance_meters is not None and not isinstance(distance_meters, int):
-        raise DependencyError(
-            "GOOGLE_RESPONSE_INVALID",
-            "computeRoutes returned a non-integer distanceMeters.",
-            details={"route": route0},
-        )
+        raise DependencyError("GOOGLE_RESPONSE_INVALID", "distanceMeters is invalid.")
     return RouteLegDetails(
-        duration_minutes=max(1, seconds // 60),
-        polyline=polyline["encodedPolyline"],
+        duration_minutes=max(
+            1,
+            _parse_duration_seconds(first.get("duration"), field_name="duration") // 60,
+        ),
+        polyline=polyline,
         distance_meters=distance_meters,
     )

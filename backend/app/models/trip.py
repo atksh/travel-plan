@@ -1,156 +1,87 @@
 from __future__ import annotations
 
-from datetime import date, datetime
-from typing import TYPE_CHECKING, Any
+from datetime import date
+from typing import TYPE_CHECKING
 
-from sqlalchemy import (
-    Boolean,
-    Date,
-    DateTime,
-    Float,
-    ForeignKey,
-    Integer,
-    String,
-    Text,
-    UniqueConstraint,
-)
-from sqlalchemy import JSON
+from sqlalchemy import Boolean, Date, Float, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin
 
 if TYPE_CHECKING:
-    from app.models.poi import PoiMaster
+    from app.models.execution import ExecutionSession
+    from app.models.place import Place
+    from app.models.rule import TripRule
+    from app.models.solve import SolvePreview, SolveRun
 
 
-class TripPlan(Base, TimestampMixin):
-    __tablename__ = "trip_plan"
+class Trip(Base, TimestampMixin):
+    __tablename__ = "trip"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    state: Mapped[str] = mapped_column(String(32), default="draft", nullable=False)
+    title: Mapped[str] = mapped_column(String(256), nullable=False)
     plan_date: Mapped[date] = mapped_column(Date, nullable=False)
+    state: Mapped[str] = mapped_column(String(32), default="draft", nullable=False)
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False)
+    origin_label: Mapped[str] = mapped_column(String(256), nullable=False)
     origin_lat: Mapped[float] = mapped_column(Float, nullable=False)
     origin_lng: Mapped[float] = mapped_column(Float, nullable=False)
-    origin_label: Mapped[str] = mapped_column(String(256), default="Start", nullable=False)
-    dest_lat: Mapped[float] = mapped_column(Float, nullable=False)
-    dest_lng: Mapped[float] = mapped_column(Float, nullable=False)
-    dest_label: Mapped[str] = mapped_column(String(256), default="End", nullable=False)
+    destination_label: Mapped[str] = mapped_column(String(256), nullable=False)
+    destination_lat: Mapped[float] = mapped_column(Float, nullable=False)
+    destination_lng: Mapped[float] = mapped_column(Float, nullable=False)
     departure_window_start_min: Mapped[int] = mapped_column(Integer, nullable=False)
     departure_window_end_min: Mapped[int] = mapped_column(Integer, nullable=False)
-    return_deadline_min: Mapped[int] = mapped_column(Integer, nullable=False)
-    weather_mode: Mapped[str] = mapped_column(String(16), default="normal", nullable=False)
+    end_constraint_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    end_constraint_minute_of_day: Mapped[int] = mapped_column(Integer, nullable=False)
+    context_weather: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    context_traffic_profile: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    workspace_version: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    accepted_run_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    preference_profile: Mapped["TripPreferenceProfile | None"] = relationship(
-        back_populates="trip", uselist=False, cascade="all, delete-orphan"
-    )
     candidates: Mapped[list["TripCandidate"]] = relationship(
         back_populates="trip", cascade="all, delete-orphan"
     )
-    execution_events: Mapped[list["TripExecutionEvent"]] = relationship(
+    rules: Mapped[list["TripRule"]] = relationship(
         back_populates="trip", cascade="all, delete-orphan"
     )
-    solver_runs: Mapped[list["SolverRun"]] = relationship(
+    solve_previews: Mapped[list["SolvePreview"]] = relationship(
         back_populates="trip", cascade="all, delete-orphan"
     )
-
-
-class TripPreferenceProfile(Base, TimestampMixin):
-    __tablename__ = "trip_preference_profile"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    trip_id: Mapped[int] = mapped_column(
-        ForeignKey("trip_plan.id", ondelete="CASCADE"), unique=True, nullable=False
+    solve_runs: Mapped[list["SolveRun"]] = relationship(
+        back_populates="trip", cascade="all, delete-orphan"
     )
-    driving_penalty_weight: Mapped[float] = mapped_column(Float, default=0.05, nullable=False)
-    max_continuous_drive_minutes: Mapped[int] = mapped_column(Integer, default=120, nullable=False)
-    preferred_lunch_tags: Mapped[list[Any]] = mapped_column(JSON, default=list)
-    preferred_dinner_tags: Mapped[list[Any]] = mapped_column(JSON, default=list)
-    must_have_cafe: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    budget_band: Mapped[str | None] = mapped_column(String(32), nullable=True)
-    pace_style: Mapped[str] = mapped_column(String(32), default="balanced", nullable=False)
-
-    trip: Mapped[TripPlan] = relationship(back_populates="preference_profile")
+    execution_session: Mapped["ExecutionSession | None"] = relationship(
+        back_populates="trip", uselist=False, cascade="all, delete-orphan"
+    )
 
 
 class TripCandidate(Base, TimestampMixin):
     __tablename__ = "trip_candidate"
     __table_args__ = (
-        UniqueConstraint("trip_id", "poi_id", name="uq_trip_candidate_trip_id_poi_id"),
+        UniqueConstraint("trip_id", "place_id", name="uq_trip_candidate_trip_id_place_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     trip_id: Mapped[int] = mapped_column(
-        ForeignKey("trip_plan.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("trip.id", ondelete="CASCADE"), nullable=False
     )
-    poi_id: Mapped[int] = mapped_column(ForeignKey("poi_master.id"), nullable=False)
-    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
-    source: Mapped[str] = mapped_column(String(32), default="seed", nullable=False)
-    must_visit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
-    excluded: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    place_id: Mapped[int] = mapped_column(
+        ForeignKey("place.id", ondelete="CASCADE"), nullable=False
+    )
+    candidate_state: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    priority: Mapped[str] = mapped_column(String(16), default="normal", nullable=False)
     locked_in: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     locked_out: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
     user_note: Mapped[str | None] = mapped_column(Text, nullable=True)
     utility_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    candidate_rank: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stay_override_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stay_override_preferred: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    stay_override_max: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    arrive_after_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    arrive_before_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    depart_after_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    depart_before_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    manual_order_hint: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    trip: Mapped[TripPlan] = relationship(back_populates="candidates")
-    poi: Mapped["PoiMaster"] = relationship()
-
-
-class TripExecutionEvent(Base, TimestampMixin):
-    __tablename__ = "trip_execution_event"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    trip_id: Mapped[int] = mapped_column(
-        ForeignKey("trip_plan.id", ondelete="CASCADE"), nullable=False
-    )
-    event_type: Mapped[str] = mapped_column(String(64), nullable=False)
-    payload_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    recorded_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
-
-    trip: Mapped[TripPlan] = relationship(back_populates="execution_events")
-
-
-class SolverRun(Base, TimestampMixin):
-    __tablename__ = "solver_run"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    trip_id: Mapped[int] = mapped_column(
-        ForeignKey("trip_plan.id", ondelete="CASCADE"), nullable=False
-    )
-    input_hash: Mapped[str] = mapped_column(String(64), nullable=False)
-    solve_started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    solve_ms: Mapped[int] = mapped_column(Integer, nullable=False)
-    objective_value: Mapped[float | None] = mapped_column(Float, nullable=True)
-    infeasible_reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    route_summary_json: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-
-    trip: Mapped[TripPlan] = relationship(back_populates="solver_runs")
-    planned_stops: Mapped[list["PlannedStop"]] = relationship(
-        back_populates="solver_run", cascade="all, delete-orphan"
-    )
-
-
-class PlannedStop(Base, TimestampMixin):
-    __tablename__ = "planned_stop"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    solver_run_id: Mapped[int] = mapped_column(
-        ForeignKey("solver_run.id", ondelete="CASCADE"), nullable=False
-    )
-    sequence_order: Mapped[int] = mapped_column(Integer, nullable=False)
-    poi_id: Mapped[int | None] = mapped_column(ForeignKey("poi_master.id"), nullable=True)
-    label: Mapped[str | None] = mapped_column(String(256), nullable=True)
-    node_kind: Mapped[str] = mapped_column(String(16), nullable=False)  # start, poi, end
-    lat: Mapped[float | None] = mapped_column(Float, nullable=True)
-    lng: Mapped[float | None] = mapped_column(Float, nullable=True)
-    arrival_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    departure_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    stay_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    leg_from_prev_min: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    status: Mapped[str] = mapped_column(String(32), default="planned", nullable=False)
-
-    solver_run: Mapped[SolverRun] = relationship(back_populates="planned_stops")
-    poi: Mapped["PoiMaster | None"] = relationship()
+    trip: Mapped[Trip] = relationship(back_populates="candidates")
+    place: Mapped["Place"] = relationship(back_populates="trip_candidates")

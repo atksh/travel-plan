@@ -1,1242 +1,863 @@
-import hashlib
-import json
-from datetime import datetime, timezone
-from typing import Any
+from __future__ import annotations
+
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
-from app.db.seed import (
-    DEFAULT_MUST_VISIT_SEED_KEYS,
-    TRIP_CANDIDATE_SEED_KEYS,
-    resolve_seed_poi_ids,
+from app.errors import RequestContractError
+from app.models.execution import ExecutionSession
+from app.models.place import Place
+from app.models.rule import TripRule
+from app.models.solve import SolvePreview, SolveRouteLeg, SolveRun, SolveStop
+from app.models.trip import Trip, TripCandidate
+from app.schemas.common import OkResponse
+from app.schemas.execution import (
+    ExecutionBootstrapOut,
+    ExecutionEventCreateIn,
+    ExecutionEventOut,
+    ExecutionStartOut,
+    ReplanAcceptedOut,
+    ReplanPreviewRequestIn,
+    ReplanRequestIn,
 )
-from app.models.poi import PoiMaster
-from app.models.trip import (
-    PlannedStop,
-    SolverRun,
-    TripCandidate,
-    TripExecutionEvent,
-    TripPlan,
-    TripPreferenceProfile,
+from app.schemas.rule import RuleCreateIn, RuleListOut, RuleOut, RulePatchIn
+from app.schemas.solve import (
+    PreviewOut,
+    PreviewRequestIn,
+    SolveAcceptedOut,
+    SolvePayloadOut,
+    SolveRequestIn,
+    SolveRunListItemOut,
+    SolveRunListOut,
 )
-from app.errors import StateContractError
-from app.schemas.poi import PoiOut
 from app.schemas.trip import (
-    ActiveTripBootstrapOut,
-    ActiveTripStateOut,
-    CandidateCreate,
+    CandidateCreateIn,
+    CandidateListOut,
     CandidateOut,
-    CandidatePatch,
-    EventCreate,
-    EventOut,
-    PlannedStopOut,
-    RouteLegOut,
-    ReplanRequest,
-    RoutePreviewOut,
-    SolveRequest,
-    SolveResponse,
-    SolveSnapshotOut,
-    SolverRunOut,
-    TripCreate,
-    TripDetailOut,
-    TripPatch,
-    TripPreferenceOut,
-    TripPreferencePatch,
+    CandidatePatchIn,
+    TripCreateIn,
+    TripListOut,
+    TripPatchIn,
+    TripSummaryOut,
+    TripWorkspaceOut,
 )
-from app.services.routing_costs import build_solve_pipeline
-from app.solver.model import SolverResult
-from app.solver.replanner import (
-    ReplanContext,
-    annotate_must_visit_failure,
-    load_replan_context,
-    prepare_replan_state,
+from app.services.execution import append_execution_event, build_execution_bootstrap, get_execution_session_or_error
+from app.services.planner import generate_solve_payload, get_trip_or_error, persist_solve_run
+from app.services.preview_store import assert_preview_matches_workspace, create_preview, get_preview_or_error
+from app.services.rule_validation import validate_rule_payload
+from app.services.workspace import (
+    increment_workspace_version,
+    serialize_candidate,
+    serialize_rule,
+    serialize_solve_run,
+    serialize_workspace,
 )
 
 router = APIRouter(prefix="/trips", tags=["trips"])
 
-DUPLICATE_CANDIDATE_DETAIL = "Candidate already exists for this POI"
-INTERNAL_TRIP_POI_CATEGORIES = frozenset({"start", "end"})
+ALLOWED_PATCH_STATE_TRANSITIONS = {
+    ("confirmed", "working"),
+    ("completed", "archived"),
+}
 
 
-def _get_trip_or_404(db: Session, trip_id: int) -> TripPlan:
-    trip = db.get(TripPlan, trip_id)
-    if trip is None:
-        raise HTTPException(status_code=404, detail="Trip not found")
-    return trip
+def _maybe_mark_trip_working(trip: Trip) -> None:
+    if trip.state == "draft":
+        trip.state = "working"
 
 
-def _default_preference_values() -> dict[str, Any]:
+def _check_workspace_version(trip: Trip, workspace_version: int | None) -> None:
+    if workspace_version is None:
+        return
+    if workspace_version != trip.workspace_version:
+        raise RequestContractError(
+            "WORKSPACE_VERSION_MISMATCH",
+            "The workspace version does not match the current trip state.",
+            details={
+                "trip_workspace_version": trip.workspace_version,
+                "request_workspace_version": workspace_version,
+            },
+            status_code=409,
+        )
+
+
+def _candidate_or_404(session: Session, trip_id: int, candidate_id: int) -> TripCandidate:
+    candidate = session.get(TripCandidate, candidate_id)
+    if candidate is None or candidate.trip_id != trip_id:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+    return candidate
+
+
+def _rule_or_404(session: Session, trip_id: int, rule_id: int) -> TripRule:
+    rule = session.get(TripRule, rule_id)
+    if rule is None or rule.trip_id != trip_id:
+        raise HTTPException(status_code=404, detail="Rule not found")
+    return rule
+
+
+def _apply_candidate_patch(candidate: TripCandidate, body: CandidatePatchIn) -> None:
+    patch = body.model_dump(exclude_unset=True)
+    if "candidate_state" in patch:
+        candidate.candidate_state = patch["candidate_state"]
+    if "priority" in patch:
+        candidate.priority = patch["priority"]
+    if "locked_in" in patch:
+        candidate.locked_in = patch["locked_in"]
+    if "locked_out" in patch:
+        candidate.locked_out = patch["locked_out"]
+    if "utility_override" in patch:
+        candidate.utility_override = patch["utility_override"]
+    if "manual_order_hint" in patch:
+        candidate.manual_order_hint = patch["manual_order_hint"]
+    if "user_note" in patch:
+        candidate.user_note = patch["user_note"]
+    stay_override = patch.get("stay_override")
+    if stay_override is not None:
+        candidate.stay_override_min = stay_override.get("min")
+        candidate.stay_override_preferred = stay_override.get("preferred")
+        candidate.stay_override_max = stay_override.get("max")
+    time_preference = patch.get("time_preference")
+    if time_preference is not None:
+        candidate.arrive_after_min = time_preference.get("arrive_after_min")
+        candidate.arrive_before_min = time_preference.get("arrive_before_min")
+        candidate.depart_after_min = time_preference.get("depart_after_min")
+        candidate.depart_before_min = time_preference.get("depart_before_min")
+
+
+def _current_target_payload(rule: TripRule) -> dict:
     return {
-        "driving_penalty_weight": 0.05,
-        "max_continuous_drive_minutes": 120,
-        "preferred_lunch_tags": [],
-        "preferred_dinner_tags": [],
-        "must_have_cafe": False,
-        "budget_band": None,
-        "pace_style": "balanced",
+        "kind": rule.target_kind,
+        "value": rule.target_payload_json.get("value"),
+        "data": {
+            key: value
+            for key, value in rule.target_payload_json.items()
+            if key != "value"
+        },
     }
 
 
-def _merged_preference_values(
-    body: TripPreferencePatch | None,
-) -> dict[str, Any]:
-    return _default_preference_values() | (
-        body.model_dump(exclude_unset=True) if body is not None else {}
-    )
+def _apply_rule_patch(rule: TripRule, body: RulePatchIn) -> None:
+    patch = body.model_dump(exclude_unset=True)
+    if "mode" in patch:
+        rule.mode = patch["mode"]
+    if "weight" in patch:
+        rule.weight = patch["weight"]
+    if "operator" in patch:
+        rule.operator = patch["operator"]
+    if "parameters" in patch:
+        rule.parameters_json = dict(patch["parameters"] or {})
+    if "carry_forward_strategy" in patch:
+        rule.carry_forward_strategy = patch["carry_forward_strategy"]
+    if "label" in patch:
+        rule.label = patch["label"]
+    if "description" in patch:
+        rule.description = patch["description"]
+    if "target" in patch:
+        rule.target_kind = patch["target"].kind
+        rule.target_payload_json = {
+            "value": patch["target"].value,
+            **dict(patch["target"].data or {}),
+        }
 
 
-def _preference_fields(pref: TripPreferenceProfile | None) -> dict[str, Any]:
-    if pref is None:
-        return _default_preference_values()
-    return {
-        "driving_penalty_weight": pref.driving_penalty_weight,
-        "max_continuous_drive_minutes": pref.max_continuous_drive_minutes,
-        "preferred_lunch_tags": list(pref.preferred_lunch_tags or []),
-        "preferred_dinner_tags": list(pref.preferred_dinner_tags or []),
-        "must_have_cafe": pref.must_have_cafe,
-        "budget_band": pref.budget_band,
-        "pace_style": pref.pace_style,
-    }
-
-
-def _serialize_preference(
-    pref: TripPreferenceProfile | None,
-) -> TripPreferenceOut | None:
-    return None if pref is None else TripPreferenceOut(**_preference_fields(pref))
-
-
-def _serialize_candidate(candidate: TripCandidate) -> CandidateOut:
-    poi = candidate.poi
-    if poi is None:
-        raise StateContractError(
-            "TRIP_CANDIDATE_POI_MISSING",
-            "Trip candidate is missing its POI relation.",
-            details={"candidate_id": candidate.id, "poi_id": candidate.poi_id},
-        )
-    return CandidateOut(
-        id=candidate.id,
-        poi_id=candidate.poi_id,
-        poi_name=poi.name,
-        primary_category=poi.primary_category,
-        status=candidate.status,
-        source=candidate.source,
-        must_visit=candidate.must_visit,
-        excluded=candidate.excluded,
-        locked_in=candidate.locked_in,
-        locked_out=candidate.locked_out,
-        user_note=candidate.user_note,
-        utility_override=candidate.utility_override,
-        candidate_rank=candidate.candidate_rank,
-    )
-
-
-def _leg_polyline_for_stop(
-    sequence_order: int, route_legs: list[RouteLegOut] | None
-) -> str | None:
-    if sequence_order <= 0 or not route_legs:
-        return None
-    leg = next(
-        (candidate for candidate in route_legs if candidate.to_sequence_order == sequence_order),
-        None,
-    )
-    return None if leg is None else leg.encoded_polyline
-
-
-def _build_route_legs(
-    planned_stops: list[PlannedStopOut],
-    refined_legs: list[Any],
-) -> list[RouteLegOut]:
-    route_legs: list[RouteLegOut] = []
-    for index, refined_leg in enumerate(refined_legs, start=1):
-        if index >= len(planned_stops):
-            raise StateContractError(
-                "ROUTE_LEG_COUNT_MISMATCH",
-                "Refined route legs did not match planned stop count.",
-                details={
-                    "planned_stop_count": len(planned_stops),
-                    "refined_leg_count": len(refined_legs),
-                },
-            )
-        duration_minutes = getattr(refined_leg, "duration_minutes", None)
-        encoded_polyline = getattr(refined_leg, "polyline", None)
-        if not isinstance(duration_minutes, int) or duration_minutes <= 0:
-            raise StateContractError(
-                "ROUTE_LEG_DURATION_INVALID",
-                "Refined route leg is missing a valid duration.",
-                details={"index": index, "duration_minutes": duration_minutes},
-            )
-        if not isinstance(encoded_polyline, str) or not encoded_polyline:
-            raise StateContractError(
-                "ROUTE_LEG_POLYLINE_INVALID",
-                "Refined route leg is missing an encoded polyline.",
-                details={"index": index},
-            )
-        distance_meters = getattr(refined_leg, "distance_meters", None)
-        if distance_meters is not None and not isinstance(distance_meters, int):
-            raise StateContractError(
-                "ROUTE_LEG_DISTANCE_INVALID",
-                "Refined route leg is missing a valid distance.",
-                details={"index": index, "distance_meters": distance_meters},
-            )
-        route_legs.append(
-            RouteLegOut(
-                from_sequence_order=index - 1,
-                to_sequence_order=index,
-                duration_minutes=duration_minutes,
-                distance_meters=distance_meters,
-                encoded_polyline=encoded_polyline,
-            )
-        )
-    return route_legs
-
-
-def _serialize_planned_stop(
-    stop: PlannedStop,
-    leg_polyline: str | None = None,
-) -> PlannedStopOut:
-    if (
-        stop.label is None
-        or stop.lat is None
-        or stop.lng is None
-        or stop.arrival_min is None
-        or stop.departure_min is None
-        or stop.stay_min is None
-    ):
-        raise StateContractError(
-            "PLANNED_STOP_INVALID",
-            "Persisted planned stop is missing required contract fields.",
-            details={"planned_stop_id": stop.id, "sequence_order": stop.sequence_order},
-        )
-    return PlannedStopOut(
-        id=stop.id,
-        sequence_order=stop.sequence_order,
-        poi_id=stop.poi_id,
-        poi_name=stop.label,
-        label=stop.label,
-        node_kind=stop.node_kind,
-        lat=stop.lat,
-        lng=stop.lng,
-        arrival_min=stop.arrival_min,
-        departure_min=stop.departure_min,
-        stay_min=stop.stay_min,
-        leg_from_prev_min=stop.leg_from_prev_min,
-        leg_polyline=leg_polyline,
-        status=stop.status,
-    )
-
-
-def _planned_stop(
-    *,
-    sequence_order: int,
-    poi_id: int | None,
-    poi_name: str,
-    label: str,
-    node_kind: str,
-    lat: float,
-    lng: float,
-    arrival_min: int,
-    departure_min: int,
-    stay_min: int,
-    leg_from_prev_min: int | None,
-    leg_polyline: str | None = None,
-) -> PlannedStopOut:
-    return PlannedStopOut(
-        sequence_order=sequence_order,
-        poi_id=poi_id,
-        poi_name=poi_name,
-        label=label,
-        node_kind=node_kind,
-        lat=lat,
-        lng=lng,
-        arrival_min=arrival_min,
-        departure_min=departure_min,
-        stay_min=stay_min,
-        leg_from_prev_min=leg_from_prev_min,
-        leg_polyline=leg_polyline,
-        status="planned",
-    )
-
-
-def _build_transient_planned_stops(
-    db: Session,
-    trip: TripPlan,
-    result: SolverResult,
-    *,
-    start_label: str | None = None,
-    start_lat: float | None = None,
-    start_lng: float | None = None,
-    end_label: str | None = None,
-    end_lat: float | None = None,
-    end_lng: float | None = None,
-    route_legs: list[RouteLegOut] | None = None,
-) -> list[PlannedStopOut]:
-    if not result.feasible:
-        return []
-
-    start_label = start_label or trip.origin_label
-    start_lat = trip.origin_lat if start_lat is None else start_lat
-    start_lng = trip.origin_lng if start_lng is None else start_lng
-    end_label = end_label or trip.dest_label
-    end_lat = trip.dest_lat if end_lat is None else end_lat
-    end_lng = trip.dest_lng if end_lng is None else end_lng
-    start_departure_min = result.start_departure_min or trip.departure_window_start_min
-    poi_map = {
-        poi.id: poi
-        for poi in db.query(PoiMaster).filter(PoiMaster.id.in_(result.ordered_poi_ids)).all()
-    }
-    stops = [
-        _planned_stop(
-            sequence_order=0,
-            poi_id=None,
-            poi_name=start_label,
-            label=start_label,
-            node_kind="start",
-            lat=start_lat,
-            lng=start_lng,
-            arrival_min=start_departure_min,
-            departure_min=start_departure_min,
-            stay_min=0,
-            leg_from_prev_min=None,
-            leg_polyline=None,
-        )
+def _trip_summaries(session: Session) -> list[dict]:
+    trips = session.query(Trip).order_by(Trip.plan_date.desc(), Trip.id.desc()).all()
+    return [
+        {
+            "id": trip.id,
+            "title": trip.title,
+            "plan_date": trip.plan_date,
+            "state": trip.state,
+            "timezone": trip.timezone,
+        }
+        for trip in trips
     ]
 
-    for index, poi_id in enumerate(result.ordered_poi_ids, start=1):
-        arrival = result.arrival_minutes[index - 1] if index - 1 < len(result.arrival_minutes) else None
-        departure = (
-            result.departure_minutes[index - 1]
-            if index - 1 < len(result.departure_minutes)
-            else None
-        )
-        poi = poi_map.get(poi_id)
-        if poi is None:
-            raise StateContractError(
-                "PLANNED_STOP_POI_MISSING",
-                "Unable to build planned stops because a solved POI is missing.",
-                details={"poi_id": poi_id},
-            )
-        if arrival is None or departure is None:
-            raise StateContractError(
-                "PLANNED_STOP_TIME_MISSING",
-                "Unable to build planned stops because solve timings are incomplete.",
-                details={"poi_id": poi_id, "sequence_order": index},
-            )
-        label = poi.name
-        stops.append(
-            _planned_stop(
-                sequence_order=index,
-                poi_id=poi_id,
-                poi_name=label,
-                label=label,
-                node_kind="poi",
-                lat=poi.lat,
-                lng=poi.lng,
-                arrival_min=arrival,
-                departure_min=departure,
-                stay_min=departure - arrival,
-                leg_from_prev_min=(
-                    result.leg_minutes[index - 1]
-                    if index - 1 < len(result.leg_minutes)
-                    else None
-                ),
-                leg_polyline=_leg_polyline_for_stop(index, route_legs),
-            )
-        )
 
-    end_index = len(result.ordered_poi_ids) + 1
-    if len(result.arrival_minutes) <= len(result.ordered_poi_ids):
-        raise StateContractError(
-            "PLANNED_STOP_END_TIME_MISSING",
-            "Unable to build planned stops because end arrival is missing.",
-            details={"trip_id": trip.id},
-        )
-    end_arrival = result.arrival_minutes[len(result.ordered_poi_ids)]
-    if end_arrival is None:
-        raise StateContractError(
-            "PLANNED_STOP_END_TIME_MISSING",
-            "Unable to build planned stops because end arrival is null.",
-            details={"trip_id": trip.id},
-        )
-    stops.append(
-        _planned_stop(
-            sequence_order=end_index,
-            poi_id=None,
-            poi_name=end_label,
-            label=end_label,
-            node_kind="end",
-            lat=end_lat,
-            lng=end_lng,
-            arrival_min=end_arrival,
-            departure_min=end_arrival,
-            stay_min=0,
-            leg_from_prev_min=result.leg_minutes[-1] if result.leg_minutes else None,
-            leg_polyline=_leg_polyline_for_stop(end_index, route_legs),
-        )
-    )
-    return stops
+def _current_minute_for_trip(trip: Trip) -> int:
+    now = datetime.now(ZoneInfo(trip.timezone))
+    return now.hour * 60 + now.minute
 
 
-def _serialize_route_legs(route_summary_json: dict[str, Any] | None) -> list[RouteLegOut]:
-    if route_summary_json is None:
-        return []
-    route_legs_raw = route_summary_json.get("route_legs")
-    if route_legs_raw is None:
-        raise StateContractError(
-            "SOLVE_SUMMARY_ROUTE_LEGS_MISSING",
-            "Latest solver run is missing canonical route leg data.",
-        )
-    return [RouteLegOut.model_validate(route_leg) for route_leg in route_legs_raw]
-
-
-def _get_latest_solve_snapshot(db: Session, trip_id: int) -> SolveSnapshotOut | None:
-    run = (
-        db.query(SolverRun)
-        .filter(SolverRun.trip_id == trip_id)
-        .order_by(SolverRun.id.desc())
-        .first()
-    )
+def _active_run_payload(session: Session, run_id: int) -> dict:
+    run = session.get(SolveRun, run_id)
     if run is None:
-        return None
-    if not isinstance(run.route_summary_json, dict):
-        raise StateContractError(
-            "SOLVE_SUMMARY_MISSING",
-            "Latest solver run is missing canonical summary data.",
-            details={"solver_run_id": run.id},
+        raise RequestContractError(
+            "REPLAN_NOT_ALLOWED",
+            "The active solve run could not be found.",
+            status_code=409,
         )
-    route_summary = run.route_summary_json
-    route_legs = _serialize_route_legs(route_summary)
     stops = (
-        db.query(PlannedStop)
-        .filter(PlannedStop.solver_run_id == run.id)
-        .order_by(PlannedStop.sequence_order)
+        session.query(SolveStop)
+        .filter(SolveStop.solve_run_id == run.id)
+        .order_by(SolveStop.sequence_order.asc())
         .all()
     )
-    serialized_stops = [
-        _serialize_planned_stop(
-            stop,
-            leg_polyline=_leg_polyline_for_stop(
-                stop.sequence_order,
-                route_legs,
-            ),
-        )
-        for stop in stops
-    ]
-    return SolveSnapshotOut(
-        feasible=bool(route_summary.get("feasible")),
-        objective=run.objective_value,
-        ordered_poi_ids=list(route_summary.get("ordered_poi_ids") or []),
-        reason_codes=list(route_summary.get("reason_codes") or []),
-        solve_ms=run.solve_ms,
-        solver_run_id=run.id,
-        used_bucket=str(route_summary.get("used_bucket") or "departure"),
-        used_traffic_matrix=bool(route_summary.get("used_traffic_matrix")),
-        shortlist_ids=list(route_summary.get("shortlist_ids") or []),
-        planned_stops=serialized_stops,
-        route_legs=route_legs,
-    )
-
-
-def _serialize_trip_detail(db: Session, trip: TripPlan) -> TripDetailOut:
-    candidates = (
-        db.query(TripCandidate)
-        .filter(TripCandidate.trip_id == trip.id)
-        .order_by(TripCandidate.id.asc())
+    route_legs = (
+        session.query(SolveRouteLeg)
+        .filter(SolveRouteLeg.solve_run_id == run.id)
+        .order_by(SolveRouteLeg.from_sequence_order.asc())
         .all()
     )
-    return TripDetailOut(
-        id=trip.id,
-        state=trip.state,
-        plan_date=trip.plan_date,
-        origin_lat=trip.origin_lat,
-        origin_lng=trip.origin_lng,
-        origin_label=trip.origin_label,
-        dest_lat=trip.dest_lat,
-        dest_lng=trip.dest_lng,
-        dest_label=trip.dest_label,
-        departure_window_start_min=trip.departure_window_start_min,
-        departure_window_end_min=trip.departure_window_end_min,
-        return_deadline_min=trip.return_deadline_min,
-        weather_mode=trip.weather_mode,
-        preference_profile=_serialize_preference(trip.preference_profile),
-        candidates=[_serialize_candidate(candidate) for candidate in candidates],
-        latest_solve=_get_latest_solve_snapshot(db, trip.id),
-    )
+    return serialize_solve_run(run, stops=stops, route_legs=route_legs)
 
 
-def _extract_event_poi_id(event: TripExecutionEvent) -> int | None:
-    if event.payload_json is None:
-        return None
-    if not isinstance(event.payload_json, dict):
-        raise StateContractError(
-            "EVENT_PAYLOAD_INVALID",
-            "Trip execution event payload must be an object.",
-            details={"event_id": event.id, "event_type": event.event_type},
-        )
-    poi_id = event.payload_json.get("poi_id")
-    if poi_id is None:
-        return None
-    if not isinstance(poi_id, int):
-        raise StateContractError(
-            "EVENT_PAYLOAD_INVALID",
-            "Trip execution event payload.poi_id must be an integer.",
-            details={"event_id": event.id, "event_type": event.event_type},
-        )
-    return poi_id
-
-
-def _first_remaining_poi_stop(
-    stops: list[PlannedStopOut],
-    completed_poi_ids: list[int],
-    *,
-    exclude_poi_id: int | None = None,
-) -> PlannedStopOut | None:
-    for stop in stops:
-        if stop.node_kind != "poi" or stop.poi_id is None:
-            continue
-        if exclude_poi_id is not None and stop.poi_id == exclude_poi_id:
-            continue
-        if stop.poi_id not in completed_poi_ids:
-            return stop
-    return None
-
-
-def _derive_active_trip_state(
-    solve_snapshot: SolveSnapshotOut | None,
-    events: list[TripExecutionEvent],
-) -> ActiveTripStateOut:
-    stops = [] if solve_snapshot is None else solve_snapshot.planned_stops
-    completed_poi_ids: list[int] = []
-    in_progress_poi_id: int | None = None
+def _derive_execution_state(events: list[dict]) -> tuple[list[int], int | None, list[int]]:
+    completed_place_ids: list[int] = []
+    skipped_place_ids: list[int] = []
+    in_progress_place_id: int | None = None
     for event in events:
-        poi_id = _extract_event_poi_id(event)
-        if event.event_type == "arrived":
-            if poi_id is None:
-                raise StateContractError(
-                    "EVENT_PAYLOAD_INVALID",
-                    "arrived events require payload.poi_id.",
-                    details={"event_id": event.id},
-                )
-            in_progress_poi_id = poi_id
-        elif event.event_type == "departed":
-            if in_progress_poi_id is not None:
-                completed_poi_ids.append(in_progress_poi_id)
-            in_progress_poi_id = None
-        elif event.event_type == "skipped":
-            if poi_id is None:
-                raise StateContractError(
-                    "EVENT_PAYLOAD_INVALID",
-                    "skipped events require payload.poi_id.",
-                    details={"event_id": event.id},
-                )
-            completed_poi_ids.append(poi_id)
-            if in_progress_poi_id == poi_id:
-                in_progress_poi_id = None
+        place_id = event["payload"].get("place_id")
+        if event["event_type"] == "arrived" and isinstance(place_id, int):
+            in_progress_place_id = place_id
+        elif event["event_type"] == "departed" and in_progress_place_id is not None:
+            completed_place_ids.append(in_progress_place_id)
+            in_progress_place_id = None
+        elif event["event_type"] == "skipped" and isinstance(place_id, int):
+            skipped_place_ids.append(place_id)
+            if in_progress_place_id == place_id:
+                in_progress_place_id = None
+    return completed_place_ids, in_progress_place_id, skipped_place_ids
 
-    poi_stops = [stop for stop in stops if stop.node_kind == "poi"]
-    current_stop = (
-        next((stop for stop in poi_stops if stop.poi_id == in_progress_poi_id), None)
-        if in_progress_poi_id is not None
-        else _first_remaining_poi_stop(poi_stops, completed_poi_ids)
+
+def _build_replan_payload(
+    *,
+    active_solve: dict,
+    completed_place_ids: list[int],
+    current_label: str,
+    suffix_solve: dict,
+) -> dict:
+    prefix_stops = [active_solve["stops"][0]]
+    prefix_stops.extend(
+        stop
+        for stop in active_solve["stops"]
+        if stop["place_id"] in completed_place_ids
     )
-
-    if in_progress_poi_id is not None:
-        current_index = (
-            -1
-            if current_stop is None
-            else next(
-                (
-                    index
-                    for index, stop in enumerate(stops)
-                    if stop.poi_id == current_stop.poi_id
-                ),
-                -1,
-            )
-        )
-        next_stop = (
-            next(
-                (stop for stop in stops[current_index + 1 :] if stop.node_kind == "poi"),
-                None,
-            )
-            if current_index >= 0
-            else _first_remaining_poi_stop(
-                poi_stops,
-                completed_poi_ids,
-                exclude_poi_id=in_progress_poi_id,
-            )
-        )
-    else:
-        current_index = (
-            -1
-            if current_stop is None
-            else next(
-                (
-                    index
-                    for index, stop in enumerate(stops)
-                    if stop.poi_id == current_stop.poi_id
-                ),
-                -1,
-            )
-        )
-        next_stop = (
-            next(
-                (stop for stop in stops[current_index + 1 :] if stop.node_kind == "poi"),
-                None,
-            )
-            if current_index >= 0
-            else None
-        )
-
-    return ActiveTripStateOut(
-        completed_poi_ids=completed_poi_ids,
-        in_progress_poi_id=in_progress_poi_id,
-        current_stop=current_stop,
-        next_stop=next_stop,
-    )
-
-
-def _ordered_unique_poi_ids(poi_ids: list[int] | None) -> list[int]:
-    return list(dict.fromkeys(poi_ids or []))
-
-
-def _load_poi_categories(db: Session, poi_ids: list[int]) -> dict[int, str]:
-    if not poi_ids:
-        return {}
-    return {
-        poi_id: category
-        for poi_id, category in (
-            db.query(PoiMaster.id, PoiMaster.primary_category)
-            .filter(PoiMaster.id.in_(poi_ids))
-            .all()
-        )
-    }
-
-
-def _validate_trip_selectable_poi_ids(db: Session, poi_ids: list[int]) -> None:
-    categories = _load_poi_categories(db, _ordered_unique_poi_ids(poi_ids))
-    for poi_id in _ordered_unique_poi_ids(poi_ids):
-        category = categories.get(poi_id)
-        if category is None:
-            raise HTTPException(status_code=404, detail=f"POI not found: {poi_id}")
-        if category in INTERNAL_TRIP_POI_CATEGORIES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"POI cannot be selected for trips: {poi_id}",
-            )
-
-
-def _get_trip_selectable_poi_or_error(db: Session, poi_id: int) -> PoiMaster:
-    poi = db.get(PoiMaster, poi_id)
-    if poi is None:
-        raise HTTPException(status_code=404, detail="POI not found")
-    if poi.primary_category in INTERNAL_TRIP_POI_CATEGORIES:
-        raise HTTPException(
-            status_code=400,
-            detail=f"POI cannot be selected for trips: {poi_id}",
-        )
-    return poi
-
-
-def _is_duplicate_trip_candidate_error(exc: IntegrityError) -> bool:
-    message = str(exc.orig).lower()
-    return "uq_trip_candidate_trip_id_poi_id" in message or (
-        "trip_candidate.trip_id" in message and "trip_candidate.poi_id" in message
-    )
-
-
-def _resolve_replan_start_metadata(
-    db: Session,
-    trip: TripPlan,
-    ctx: ReplanContext,
-) -> tuple[str, float, float]:
-    if ctx.current_lat is not None and ctx.current_lng is not None:
-        return "Current location", ctx.current_lat, ctx.current_lng
-    if ctx.in_progress_poi_id is not None:
-        current_poi = db.get(PoiMaster, ctx.in_progress_poi_id)
-        if current_poi is not None:
-            return current_poi.name, current_poi.lat, current_poi.lng
-    return trip.origin_label, trip.origin_lat, trip.origin_lng
-
-
-def _resolve_initial_candidate_state(
-    db: Session,
-    body: TripCreate,
-) -> tuple[list[int], set[int], set[int]]:
-    must_visit_ids = _ordered_unique_poi_ids(body.initial_must_visit_poi_ids)
-    excluded_ids = _ordered_unique_poi_ids(body.initial_excluded_poi_ids)
-    overlap = set(must_visit_ids) & set(excluded_ids)
-    if overlap:
-        raise HTTPException(
-            status_code=400,
-            detail="POIs cannot be both must-visit and excluded",
-        )
-
-    explicit_candidate_ids = must_visit_ids + [
-        poi_id for poi_id in excluded_ids if poi_id not in must_visit_ids
+    prefix_legs = [
+        leg
+        for leg in active_solve["route_legs"]
+        if leg["to_sequence_order"] <= len(prefix_stops) - 1
     ]
-    _validate_trip_selectable_poi_ids(db, explicit_candidate_ids)
-
-    candidate_ids = list(
-        resolve_seed_poi_ids(db, TRIP_CANDIDATE_SEED_KEYS, trip_selectable_only=True)
-    )
-    candidate_ids.extend(
-        poi_id for poi_id in explicit_candidate_ids if poi_id not in candidate_ids
-    )
-    excluded = {poi_id for poi_id in excluded_ids if poi_id in candidate_ids}
-    if body.initial_must_visit_poi_ids is None:
-        must_visit = set(resolve_seed_poi_ids(db, DEFAULT_MUST_VISIT_SEED_KEYS))
-        must_visit &= set(candidate_ids)
-        must_visit -= excluded
-    else:
-        must_visit = {poi_id for poi_id in must_visit_ids if poi_id in candidate_ids}
-    return candidate_ids, must_visit, excluded
-
-
-def _candidate_state(candidates: list[TripCandidate]) -> dict[str, Any]:
+    offset = len(prefix_stops)
+    suffix_stops = []
+    for stop in suffix_solve["stops"]:
+        copied = dict(stop)
+        if copied["sequence_order"] == 0:
+            copied["sequence_order"] = offset
+            copied["status"] = "current"
+            copied["label"] = current_label
+        else:
+            copied["sequence_order"] = copied["sequence_order"] + offset
+        suffix_stops.append(copied)
+    merged_stops = prefix_stops + suffix_stops
+    merged_legs = list(prefix_legs)
+    for leg in suffix_solve["route_legs"]:
+        merged_legs.append(
+            {
+                "from_sequence_order": leg["from_sequence_order"] + offset,
+                "to_sequence_order": leg["to_sequence_order"] + offset,
+                "duration_minutes": leg["duration_minutes"],
+                "distance_meters": leg["distance_meters"],
+                "encoded_polyline": leg["encoded_polyline"],
+            }
+        )
     return {
-        "candidate_ids": [candidate.poi_id for candidate in candidates if not candidate.locked_out],
-        "must_visit": {
-            candidate.poi_id
-            for candidate in candidates
-            if candidate.must_visit or candidate.locked_in
+        "summary": {
+            "feasible": suffix_solve["summary"]["feasible"],
+            "score": suffix_solve["summary"]["score"],
+            "total_drive_minutes": active_solve["summary"]["total_drive_minutes"] + suffix_solve["summary"]["total_drive_minutes"],
+            "total_stay_minutes": active_solve["summary"]["total_stay_minutes"] + suffix_solve["summary"]["total_stay_minutes"],
+            "total_distance_meters": active_solve["summary"]["total_distance_meters"] + suffix_solve["summary"]["total_distance_meters"],
+            "start_time_min": merged_stops[0]["departure_min"],
+            "end_time_min": merged_stops[-1]["arrival_min"],
         },
-        "excluded_ids": {
-            candidate.poi_id
-            for candidate in candidates
-            if candidate.excluded or candidate.locked_out
-        },
-        "utility_overrides": {
-            candidate.poi_id: candidate.utility_override
-            for candidate in candidates
-            if candidate.utility_override is not None
-        },
+        "stops": merged_stops,
+        "route_legs": merged_legs,
+        "selected_place_ids": list(
+            dict.fromkeys(active_solve["selected_place_ids"] + suffix_solve["selected_place_ids"])
+        ),
+        "unselected_candidates": suffix_solve["unselected_candidates"],
+        "rule_results": suffix_solve["rule_results"],
+        "warnings": suffix_solve["warnings"],
+        "alternatives": suffix_solve["alternatives"],
     }
 
 
-def _hash_solver_payload(payload: dict[str, Any]) -> str:
-    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
-
-
-def _append_event(
-    db: Session,
-    trip_id: int,
-    event_type: str,
-    payload: dict[str, Any] | None = None,
-) -> TripExecutionEvent:
-    event = TripExecutionEvent(
-        trip_id=trip_id,
-        event_type=event_type,
-        payload_json=payload,
-        recorded_at=datetime.now(timezone.utc),
-    )
-    db.add(event)
-    return event
-
-
-def _persist_solver_run(
-    db: Session,
-    *,
-    trip_id: int,
-    input_hash: str,
-    started_at: datetime,
-    result: SolverResult,
-    summary: dict[str, Any],
-) -> SolverRun:
-    run = SolverRun(
-        trip_id=trip_id,
-        input_hash=input_hash,
-        solve_started_at=started_at,
-        solve_ms=result.solve_ms,
-        objective_value=result.objective,
-        infeasible_reason=",".join(result.reason_codes) if result.reason_codes else None,
-        route_summary_json=summary,
-    )
-    db.add(run)
-    db.flush()
-    return run
-
-
-def _persist_planned_stops(
-    db: Session,
-    run_id: int,
-    planned_stops: list[PlannedStopOut],
-) -> None:
-    for stop in planned_stops:
-        db.add(
-            PlannedStop(
-                solver_run_id=run_id,
-                sequence_order=stop.sequence_order,
-                poi_id=stop.poi_id,
-                label=stop.label,
-                node_kind=stop.node_kind,
-                lat=stop.lat,
-                lng=stop.lng,
-                arrival_min=stop.arrival_min,
-                departure_min=stop.departure_min,
-                stay_min=stop.stay_min,
-                leg_from_prev_min=stop.leg_from_prev_min,
-                status=stop.status,
+def _persist_preview_patches_to_workspace(trip: Trip, preview: SolvePreview, session: Session) -> None:
+    draft_context = preview.draft_context_json or {}
+    for patch in draft_context.get("draft_candidate_patches", []):
+        candidate = session.get(TripCandidate, patch.get("candidate_id"))
+        if candidate is None or candidate.trip_id != trip.id:
+            continue
+        _apply_candidate_patch(candidate, CandidatePatchIn.model_validate(patch))
+    for patch in draft_context.get("draft_rule_patches", []):
+        action = patch.get("action", "update")
+        if action == "delete":
+            rule = session.get(TripRule, patch.get("rule_id"))
+            if rule is not None and rule.trip_id == trip.id:
+                session.delete(rule)
+            continue
+        if action == "create":
+            target = patch["target"]
+            validate_rule_payload(
+                rule_kind=patch["rule_kind"],
+                mode=patch["mode"],
+                operator=patch["operator"],
+                target_kind=target["kind"],
+                parameters=patch.get("parameters"),
+                weight=patch.get("weight"),
             )
-        )
+            session.add(
+                TripRule(
+                    trip_id=trip.id,
+                    rule_kind=patch["rule_kind"],
+                    scope=patch["scope"],
+                    mode=patch["mode"],
+                    weight=patch.get("weight"),
+                    target_kind=target["kind"],
+                    target_payload_json={"value": target.get("value"), **(target.get("data") or {})},
+                    operator=patch["operator"],
+                    parameters_json=dict(patch.get("parameters") or {}),
+                    carry_forward_strategy=patch["carry_forward_strategy"],
+                    label=patch["label"],
+                    description=patch.get("description"),
+                    created_by_surface=patch.get("created_by_surface", "ui"),
+                )
+            )
+            continue
+        rule = session.get(TripRule, patch.get("rule_id"))
+        if rule is None or rule.trip_id != trip.id:
+            continue
+        _apply_rule_patch(rule, RulePatchIn.model_validate(patch))
+    if draft_context.get("draft_candidate_patches") or draft_context.get("draft_rule_patches"):
+        increment_workspace_version(trip)
 
 
-def _solve_response(
-    result: SolverResult,
-    planned_stops: list[PlannedStopOut],
-    *,
-    run_id: int,
-    used_bucket: str,
-    used_traffic_matrix: bool,
-    shortlist_ids: list[int],
-    route_legs: list[RouteLegOut],
-    alternatives: list[CandidateOut] | None = None,
-) -> SolveResponse:
-    return SolveResponse(
-        feasible=result.feasible,
-        objective=result.objective,
-        ordered_poi_ids=result.ordered_poi_ids,
-        reason_codes=result.reason_codes,
-        solve_ms=result.solve_ms,
-        used_bucket=used_bucket,
-        used_traffic_matrix=used_traffic_matrix,
-        shortlist_ids=shortlist_ids,
-        planned_stops=planned_stops,
-        route_legs=route_legs,
-        solver_run_id=run_id,
-        alternatives=alternatives or [],
-    )
+@router.get("", response_model=TripListOut)
+def list_trips(db: Session = Depends(get_db)) -> TripListOut:
+    return TripListOut(items=[TripSummaryOut.model_validate(item) for item in _trip_summaries(db)])
 
 
-@router.post("", response_model=TripDetailOut)
-def create_trip(body: TripCreate, db: Session = Depends(get_db)) -> TripDetailOut:
-    candidate_ids, must_visit_ids, excluded_ids = _resolve_initial_candidate_state(db, body)
-    default_seed_candidate_ids = set(
-        resolve_seed_poi_ids(db, TRIP_CANDIDATE_SEED_KEYS, trip_selectable_only=True)
-    )
-    trip = TripPlan(
-        state="draft",
+@router.post("", response_model=TripWorkspaceOut, status_code=201)
+def create_trip(body: TripCreateIn, db: Session = Depends(get_db)) -> TripWorkspaceOut:
+    trip = Trip(
+        title=body.title,
         plan_date=body.plan_date,
-        origin_lat=body.origin_lat,
-        origin_lng=body.origin_lng,
-        origin_label=body.origin_label,
-        dest_lat=body.dest_lat,
-        dest_lng=body.dest_lng,
-        dest_label=body.dest_label,
+        state="draft",
+        timezone=body.timezone,
+        origin_label=body.origin.label,
+        origin_lat=body.origin.lat,
+        origin_lng=body.origin.lng,
+        destination_label=body.destination.label,
+        destination_lat=body.destination.lat,
+        destination_lng=body.destination.lng,
         departure_window_start_min=body.departure_window_start_min,
         departure_window_end_min=body.departure_window_end_min,
-        return_deadline_min=body.return_deadline_min,
-        weather_mode=body.weather_mode,
+        end_constraint_kind=body.end_constraint.kind,
+        end_constraint_minute_of_day=body.end_constraint.minute_of_day,
+        context_weather=body.context.get("weather"),
+        context_traffic_profile=body.context.get("traffic_profile", "default"),
+        workspace_version=1,
+        accepted_run_id=None,
     )
     db.add(trip)
-    db.flush()
-    db.add(TripPreferenceProfile(trip_id=trip.id, **_merged_preference_values(body.preferences)))
-    for poi_id in candidate_ids:
-        db.add(
-            TripCandidate(
-                trip_id=trip.id,
-                poi_id=poi_id,
-                status="active",
-                source="seed" if poi_id in default_seed_candidate_ids else "user",
-                excluded=poi_id in excluded_ids,
-                must_visit=poi_id in must_visit_ids,
+    db.commit()
+    db.refresh(trip)
+    return TripWorkspaceOut.model_validate(serialize_workspace(db, trip))
+
+
+@router.get("/{trip_id}", response_model=TripWorkspaceOut)
+def get_trip(trip_id: int, db: Session = Depends(get_db)) -> TripWorkspaceOut:
+    return TripWorkspaceOut.model_validate(serialize_workspace(db, get_trip_or_error(db, trip_id)))
+
+
+@router.patch("/{trip_id}", response_model=TripWorkspaceOut)
+def patch_trip(trip_id: int, body: TripPatchIn, db: Session = Depends(get_db)) -> TripWorkspaceOut:
+    trip = get_trip_or_error(db, trip_id)
+    patch = body.model_dump(exclude_unset=True)
+    changed = False
+    if "state" in patch:
+        if (trip.state, patch["state"]) not in ALLOWED_PATCH_STATE_TRANSITIONS:
+            raise RequestContractError(
+                "RULE_VALIDATION_FAILED",
+                "This trip state transition is not allowed.",
+                details={"from_state": trip.state, "to_state": patch["state"]},
             )
+        trip.state = patch["state"]
+        changed = True
+    if "title" in patch:
+        trip.title = patch["title"]
+        changed = True
+    if "origin" in patch:
+        trip.origin_label = patch["origin"].label
+        trip.origin_lat = patch["origin"].lat
+        trip.origin_lng = patch["origin"].lng
+        changed = True
+    if "destination" in patch:
+        trip.destination_label = patch["destination"].label
+        trip.destination_lat = patch["destination"].lat
+        trip.destination_lng = patch["destination"].lng
+        changed = True
+    if "departure_window_start_min" in patch:
+        trip.departure_window_start_min = patch["departure_window_start_min"]
+        changed = True
+    if "departure_window_end_min" in patch:
+        trip.departure_window_end_min = patch["departure_window_end_min"]
+        changed = True
+    if "end_constraint" in patch:
+        trip.end_constraint_kind = patch["end_constraint"].kind
+        trip.end_constraint_minute_of_day = patch["end_constraint"].minute_of_day
+        changed = True
+    if "timezone" in patch:
+        trip.timezone = patch["timezone"]
+        changed = True
+    if "context" in patch:
+        trip.context_weather = patch["context"].get("weather")
+        trip.context_traffic_profile = patch["context"].get("traffic_profile", "default")
+        changed = True
+    if changed:
+        increment_workspace_version(trip)
+        _maybe_mark_trip_working(trip)
+    db.commit()
+    db.refresh(trip)
+    return TripWorkspaceOut.model_validate(serialize_workspace(db, trip))
+
+
+@router.get("/{trip_id}/candidates", response_model=CandidateListOut)
+def list_candidates(trip_id: int, db: Session = Depends(get_db)) -> CandidateListOut:
+    trip = get_trip_or_error(db, trip_id)
+    return CandidateListOut(items=[CandidateOut.model_validate(serialize_candidate(candidate)) for candidate in trip.candidates])
+
+
+@router.post("/{trip_id}/candidates", response_model=CandidateOut, status_code=201)
+def add_candidate(trip_id: int, body: CandidateCreateIn, db: Session = Depends(get_db)) -> CandidateOut:
+    trip = get_trip_or_error(db, trip_id)
+    place = db.get(Place, body.place_id)
+    if place is None:
+        raise RequestContractError("PLACE_NOT_FOUND", "Place not found.", status_code=404)
+    duplicate = (
+        db.query(TripCandidate)
+        .filter(TripCandidate.trip_id == trip.id, TripCandidate.place_id == body.place_id)
+        .one_or_none()
+    )
+    if duplicate is not None:
+        raise RequestContractError(
+            "RULE_VALIDATION_FAILED",
+            "Candidate already exists for this place.",
+            status_code=409,
         )
-    db.commit()
-    db.refresh(trip)
-    return _serialize_trip_detail(db, trip)
-
-
-@router.get("/{trip_id}", response_model=TripDetailOut)
-def get_trip(trip_id: int, db: Session = Depends(get_db)) -> TripDetailOut:
-    return _serialize_trip_detail(db, _get_trip_or_404(db, trip_id))
-
-
-@router.patch("/{trip_id}", response_model=TripDetailOut)
-def patch_trip(
-    trip_id: int, body: TripPatch, db: Session = Depends(get_db)
-) -> TripDetailOut:
-    trip = _get_trip_or_404(db, trip_id)
-    if body.state is not None:
-        trip.state = body.state
-    if body.weather_mode is not None:
-        if trip.weather_mode != body.weather_mode:
-            _append_event(db, trip_id, "weather_changed", {"weather_mode": body.weather_mode})
-        trip.weather_mode = body.weather_mode
-    db.commit()
-    db.refresh(trip)
-    return _serialize_trip_detail(db, trip)
-
-
-@router.patch("/{trip_id}/preferences", response_model=TripDetailOut)
-def patch_preferences(
-    trip_id: int, body: TripPreferencePatch, db: Session = Depends(get_db)
-) -> TripDetailOut:
-    trip = _get_trip_or_404(db, trip_id)
-    pref = trip.preference_profile
-    if pref is None:
-        raise HTTPException(status_code=400, detail="No preference profile")
-    for key, value in body.model_dump(exclude_unset=True).items():
-        setattr(pref, key, value)
-    db.commit()
-    db.refresh(trip)
-    return _serialize_trip_detail(db, trip)
-
-
-@router.get("/{trip_id}/candidates", response_model=list[CandidateOut])
-def list_candidates(trip_id: int, db: Session = Depends(get_db)) -> list[CandidateOut]:
-    _get_trip_or_404(db, trip_id)
-    candidates = (
-        db.query(TripCandidate)
-        .filter(TripCandidate.trip_id == trip_id)
-        .order_by(TripCandidate.id.asc())
-        .all()
-    )
-    return [_serialize_candidate(candidate) for candidate in candidates]
-
-
-@router.post("/{trip_id}/candidates", response_model=CandidateOut)
-def add_candidate(
-    trip_id: int, body: CandidateCreate, db: Session = Depends(get_db)
-) -> CandidateOut:
-    _get_trip_or_404(db, trip_id)
-    _get_trip_selectable_poi_or_error(db, body.poi_id)
-    existing_candidate = (
-        db.query(TripCandidate)
-        .filter(TripCandidate.trip_id == trip_id, TripCandidate.poi_id == body.poi_id)
-        .first()
-    )
-    if existing_candidate is not None:
-        raise HTTPException(status_code=409, detail=DUPLICATE_CANDIDATE_DETAIL)
     candidate = TripCandidate(
-        trip_id=trip_id,
-        poi_id=body.poi_id,
-        status="active",
-        source="user",
-        must_visit=body.must_visit,
-        excluded=body.excluded,
-        user_note=body.user_note,
+        trip_id=trip.id,
+        place_id=body.place_id,
+        candidate_state="active",
+        priority=body.priority,
+        locked_in=False,
+        locked_out=False,
     )
     db.add(candidate)
-    try:
-        db.commit()
-    except IntegrityError as exc:
-        db.rollback()
-        if _is_duplicate_trip_candidate_error(exc):
-            raise HTTPException(status_code=409, detail=DUPLICATE_CANDIDATE_DETAIL) from exc
-        raise
+    increment_workspace_version(trip)
+    _maybe_mark_trip_working(trip)
+    db.commit()
     db.refresh(candidate)
-    return _serialize_candidate(candidate)
+    return CandidateOut.model_validate(serialize_candidate(candidate))
 
 
 @router.patch("/{trip_id}/candidates/{candidate_id}", response_model=CandidateOut)
 def patch_candidate(
     trip_id: int,
     candidate_id: int,
-    body: CandidatePatch,
+    body: CandidatePatchIn,
     db: Session = Depends(get_db),
 ) -> CandidateOut:
-    candidate = db.get(TripCandidate, candidate_id)
-    if candidate is None or candidate.trip_id != trip_id:
-        raise HTTPException(status_code=404, detail="Candidate not found")
-    for key, value in body.model_dump(exclude_unset=True).items():
-        setattr(candidate, key, value)
+    trip = get_trip_or_error(db, trip_id)
+    candidate = _candidate_or_404(db, trip_id, candidate_id)
+    _apply_candidate_patch(candidate, body)
+    increment_workspace_version(trip)
+    _maybe_mark_trip_working(trip)
     db.commit()
     db.refresh(candidate)
-    return _serialize_candidate(candidate)
+    return CandidateOut.model_validate(serialize_candidate(candidate))
 
 
-@router.delete("/{trip_id}/candidates/{candidate_id}")
-def delete_candidate(
-    trip_id: int, candidate_id: int, db: Session = Depends(get_db)
-) -> dict[str, bool]:
-    candidate = db.get(TripCandidate, candidate_id)
-    if candidate is None or candidate.trip_id != trip_id:
-        raise HTTPException(status_code=404, detail="Candidate not found")
+@router.delete("/{trip_id}/candidates/{candidate_id}", response_model=OkResponse)
+def delete_candidate(trip_id: int, candidate_id: int, db: Session = Depends(get_db)) -> OkResponse:
+    trip = get_trip_or_error(db, trip_id)
+    candidate = _candidate_or_404(db, trip_id, candidate_id)
     db.delete(candidate)
+    increment_workspace_version(trip)
+    _maybe_mark_trip_working(trip)
     db.commit()
-    return {"ok": True}
+    return OkResponse(ok=True)
 
 
-@router.post("/{trip_id}/events", response_model=EventOut)
-def post_event(
-    trip_id: int, body: EventCreate, db: Session = Depends(get_db)
-) -> TripExecutionEvent:
-    _get_trip_or_404(db, trip_id)
-    event = _append_event(db, trip_id, body.event_type, body.payload)
+@router.get("/{trip_id}/rules", response_model=RuleListOut)
+def list_rules(trip_id: int, db: Session = Depends(get_db)) -> RuleListOut:
+    trip = get_trip_or_error(db, trip_id)
+    return RuleListOut(items=[RuleOut.model_validate(serialize_rule(rule)) for rule in trip.rules])
+
+
+@router.post("/{trip_id}/rules", response_model=RuleOut, status_code=201)
+def create_rule(trip_id: int, body: RuleCreateIn, db: Session = Depends(get_db)) -> RuleOut:
+    trip = get_trip_or_error(db, trip_id)
+    validate_rule_payload(
+        rule_kind=body.rule_kind,
+        mode=body.mode,
+        operator=body.operator,
+        target_kind=body.target.kind,
+        parameters=body.parameters,
+        weight=body.weight,
+    )
+    rule = TripRule(
+        trip_id=trip.id,
+        rule_kind=body.rule_kind,
+        scope=body.scope,
+        mode=body.mode,
+        weight=body.weight,
+        target_kind=body.target.kind,
+        target_payload_json={"value": body.target.value, **dict(body.target.data or {})},
+        operator=body.operator,
+        parameters_json=dict(body.parameters or {}),
+        carry_forward_strategy=body.carry_forward_strategy,
+        label=body.label,
+        description=body.description,
+        created_by_surface=body.created_by_surface,
+    )
+    db.add(rule)
+    increment_workspace_version(trip)
+    _maybe_mark_trip_working(trip)
     db.commit()
-    db.refresh(event)
-    return event
+    db.refresh(rule)
+    return RuleOut.model_validate(serialize_rule(rule))
 
 
-@router.get("/{trip_id}/events", response_model=list[EventOut])
-def list_events(trip_id: int, db: Session = Depends(get_db)) -> list[TripExecutionEvent]:
-    _get_trip_or_404(db, trip_id)
-    return (
-        db.query(TripExecutionEvent)
-        .filter(TripExecutionEvent.trip_id == trip_id)
-        .order_by(TripExecutionEvent.recorded_at.asc())
-        .all()
+@router.patch("/{trip_id}/rules/{rule_id}", response_model=RuleOut)
+def patch_rule(trip_id: int, rule_id: int, body: RulePatchIn, db: Session = Depends(get_db)) -> RuleOut:
+    trip = get_trip_or_error(db, trip_id)
+    rule = _rule_or_404(db, trip_id, rule_id)
+    target = body.target.model_dump() if body.target is not None else _current_target_payload(rule)
+    validate_rule_payload(
+        rule_kind=rule.rule_kind,
+        mode=body.mode or rule.mode,
+        operator=body.operator or rule.operator,
+        target_kind=target["kind"],
+        parameters=body.parameters if body.parameters is not None else rule.parameters_json,
+        weight=body.weight if body.weight is not None else rule.weight,
     )
+    _apply_rule_patch(rule, body)
+    increment_workspace_version(trip)
+    _maybe_mark_trip_working(trip)
+    db.commit()
+    db.refresh(rule)
+    return RuleOut.model_validate(serialize_rule(rule))
 
 
-@router.post("/{trip_id}/solve", response_model=SolveResponse)
-async def solve_endpoint(
-    trip_id: int, body: SolveRequest, db: Session = Depends(get_db)
-) -> SolveResponse:
-    trip = _get_trip_or_404(db, trip_id)
-    pref = trip.preference_profile
-    candidates = (
-        db.query(TripCandidate)
-        .filter(
-            TripCandidate.trip_id == trip_id,
-            TripCandidate.status == "active",
-            TripCandidate.excluded.is_(False),
-        )
-        .all()
-    )
-    state = _candidate_state(candidates)
-    pref_values = _preference_fields(pref)
-    pipeline = await build_solve_pipeline(
+@router.delete("/{trip_id}/rules/{rule_id}", response_model=OkResponse)
+def delete_rule(trip_id: int, rule_id: int, db: Session = Depends(get_db)) -> OkResponse:
+    trip = get_trip_or_error(db, trip_id)
+    rule = _rule_or_404(db, trip_id, rule_id)
+    db.delete(rule)
+    increment_workspace_version(trip)
+    _maybe_mark_trip_working(trip)
+    db.commit()
+    return OkResponse(ok=True)
+
+
+@router.post("/{trip_id}/preview", response_model=PreviewOut)
+async def preview_trip(trip_id: int, body: PreviewRequestIn, db: Session = Depends(get_db)) -> PreviewOut:
+    trip = get_trip_or_error(db, trip_id)
+    _check_workspace_version(trip, body.workspace_version)
+    solve_payload = await generate_solve_payload(
         db,
-        trip,
-        use_traffic_matrix=body.use_traffic_matrix,
-        candidate_ids=state["candidate_ids"],
-        must_visit=state["must_visit"],
-        excluded_ids=state["excluded_ids"],
-        utility_overrides=state["utility_overrides"],
-        max_continuous_drive_minutes=pref_values["max_continuous_drive_minutes"],
+        trip=trip,
+        draft_candidate_patches=body.draft_candidate_patches,
+        draft_rule_patches=body.draft_rule_patches,
+        draft_order_edits=body.draft_order_edits,
     )
-    result = pipeline.solver_result
-    started_at = datetime.now(timezone.utc)
-    planned_stops = _build_transient_planned_stops(
+    preview = create_preview(
         db,
-        trip,
-        result,
-        route_legs=None,
+        trip=trip,
+        preview_kind="planned",
+        solve_payload=solve_payload,
+        draft_context=body.model_dump(),
     )
-    route_legs = _build_route_legs(planned_stops, pipeline.refined_legs)
-    planned_stops = _build_transient_planned_stops(
-        db,
-        trip,
-        result,
-        route_legs=route_legs,
-    )
-    input_hash = _hash_solver_payload(
+    _maybe_mark_trip_working(trip)
+    db.commit()
+    return PreviewOut.model_validate(
         {
-            "ids": state["candidate_ids"],
-            "must": sorted(state["must_visit"]),
-            "dep": trip.departure_window_start_min,
-            "dep_end": trip.departure_window_end_min,
-            "deadline": trip.return_deadline_min,
-            "weather_mode": trip.weather_mode,
-            "use_traffic_matrix": body.use_traffic_matrix,
-            **pref_values,
+            "preview_id": preview.preview_id,
+            "workspace_version": trip.workspace_version,
+            "based_on_run_id": trip.accepted_run_id,
+            "solve": solve_payload,
         }
     )
-    run = _persist_solver_run(
+
+
+@router.post("/{trip_id}/solve", response_model=SolveAcceptedOut)
+async def solve_trip_endpoint(trip_id: int, body: SolveRequestIn, db: Session = Depends(get_db)) -> SolveAcceptedOut:
+    trip = get_trip_or_error(db, trip_id)
+    _check_workspace_version(trip, body.workspace_version)
+    if body.preview_id:
+        preview = get_preview_or_error(db, body.preview_id)
+        assert_preview_matches_workspace(
+            trip=trip, preview=preview, workspace_version=body.workspace_version
+        )
+        solve_payload = dict(preview.solve_json)
+        based_on_preview_id = preview.preview_id
+    else:
+        solve_payload = await generate_solve_payload(db, trip=trip)
+        based_on_preview_id = None
+    run = persist_solve_run(
         db,
-        trip_id=trip_id,
-        input_hash=input_hash,
-        started_at=started_at,
-        result=result,
-        summary={
-            "reason_codes": result.reason_codes,
-            "feasible": result.feasible,
-            "ordered_poi_ids": result.ordered_poi_ids,
-            "shortlist_ids": pipeline.shortlist_ids,
-            "used_bucket": pipeline.used_bucket,
-            "used_traffic_matrix": pipeline.used_traffic_matrix,
-            "route_legs": [route_leg.model_dump() for route_leg in route_legs],
-        },
+        trip=trip,
+        run_kind="planned",
+        solve_payload=solve_payload,
+        based_on_preview_id=based_on_preview_id,
     )
-    _persist_planned_stops(db, run.id, planned_stops)
+    trip.accepted_run_id = run.id
+    trip.state = "confirmed"
     db.commit()
-    return _solve_response(
-        result,
-        planned_stops,
-        run_id=run.id,
-        used_bucket=pipeline.used_bucket,
-        used_traffic_matrix=pipeline.used_traffic_matrix,
-        shortlist_ids=pipeline.shortlist_ids,
-        route_legs=route_legs,
+    return SolveAcceptedOut.model_validate(
+        {"solve_run_id": run.id, "accepted": True, "solve": solve_payload}
     )
 
 
-@router.post("/{trip_id}/replan", response_model=SolveResponse)
-async def replan_endpoint(
-    trip_id: int, body: ReplanRequest, db: Session = Depends(get_db)
-) -> SolveResponse:
-    trip = _get_trip_or_404(db, trip_id)
-    ctx = load_replan_context(db, trip_id)
-    if body.current_lat is not None and body.current_lng is not None:
-        ctx.current_lat = body.current_lat
-        ctx.current_lng = body.current_lng
-    state = prepare_replan_state(db, ctx)
-    pref = state.trip.preference_profile
-    pref_values = _preference_fields(pref)
-    pipeline = await build_solve_pipeline(
-        db,
-        state.trip,
-        use_traffic_matrix=True,
-        origin_override=state.origin_override,
-        departure_start_min=ctx.now_minute,
-        departure_window_end_min=ctx.now_minute,
-        candidate_ids=state.remaining_candidate_ids,
-        must_visit=state.must_visit_ids,
-        excluded_ids=state.excluded_ids,
-        utility_overrides=state.utility_overrides,
-        max_continuous_drive_minutes=pref_values["max_continuous_drive_minutes"],
-        satisfied_categories=state.satisfied_categories,
-        cafe_requirement_already_met=state.cafe_requirement_already_met,
+@router.get("/{trip_id}/solve-runs", response_model=SolveRunListOut)
+def list_solve_runs(trip_id: int, db: Session = Depends(get_db)) -> SolveRunListOut:
+    get_trip_or_error(db, trip_id)
+    runs = (
+        db.query(SolveRun)
+        .filter(SolveRun.trip_id == trip_id)
+        .order_by(SolveRun.id.desc())
+        .all()
     )
-    state = annotate_must_visit_failure(
-        db,
-        pipeline.solver_result,
-        state,
-        now_minute=ctx.now_minute,
+    return SolveRunListOut(
+        items=[
+            SolveRunListItemOut.model_validate(
+                {
+                    "solve_run_id": run.id,
+                    "run_kind": run.run_kind,
+                    "accepted_at": run.accepted_at.isoformat(),
+                    "summary": run.summary_json,
+                }
+            )
+            for run in runs
+        ]
     )
-    result = pipeline.solver_result
-    start_label, start_lat, start_lng = _resolve_replan_start_metadata(db, trip, ctx)
-    planned_stops = _build_transient_planned_stops(
-        db,
-        trip,
-        result,
-        start_label=start_label,
-        start_lat=start_lat,
-        start_lng=start_lng,
-        route_legs=None,
+
+
+@router.get("/{trip_id}/solve-runs/{run_id}", response_model=SolvePayloadOut)
+def get_solve_run(trip_id: int, run_id: int, db: Session = Depends(get_db)) -> SolvePayloadOut:
+    get_trip_or_error(db, trip_id)
+    run = session_run = db.get(SolveRun, run_id)
+    if session_run is None or session_run.trip_id != trip_id:
+        raise HTTPException(status_code=404, detail="Solve run not found")
+    stops = (
+        db.query(SolveStop)
+        .filter(SolveStop.solve_run_id == session_run.id)
+        .order_by(SolveStop.sequence_order.asc())
+        .all()
     )
-    route_legs = _build_route_legs(planned_stops, pipeline.refined_legs)
-    planned_stops = _build_transient_planned_stops(
-        db,
-        trip,
-        result,
-        start_label=start_label,
-        start_lat=start_lat,
-        start_lng=start_lng,
-        route_legs=route_legs,
+    route_legs = (
+        db.query(SolveRouteLeg)
+        .filter(SolveRouteLeg.solve_run_id == session_run.id)
+        .order_by(SolveRouteLeg.from_sequence_order.asc())
+        .all()
     )
-    input_hash = _hash_solver_payload(
+    return SolvePayloadOut.model_validate(
+        serialize_solve_run(run, stops=stops, route_legs=route_legs)
+    )
+
+
+@router.post("/{trip_id}/execution/start", response_model=ExecutionStartOut)
+def start_execution(trip_id: int, db: Session = Depends(get_db)) -> ExecutionStartOut:
+    trip = get_trip_or_error(db, trip_id)
+    if trip.state != "confirmed" or trip.accepted_run_id is None:
+        raise RequestContractError(
+            "REPLAN_NOT_ALLOWED",
+            "Execution can only start from a confirmed trip with an accepted solve.",
+            status_code=409,
+        )
+    execution_session = (
+        db.query(ExecutionSession)
+        .filter(ExecutionSession.trip_id == trip.id)
+        .one_or_none()
+    )
+    if execution_session is None:
+        execution_session = ExecutionSession(
+            trip_id=trip.id,
+            active_run_id=trip.accepted_run_id,
+            status="active",
+            started_at=datetime.now(),
+            completed_at=None,
+            current_stop_sequence_order=None,
+            suffix_origin_kind="accepted_run",
+            suffix_origin_payload_json={},
+        )
+        db.add(execution_session)
+        db.flush()
+    else:
+        execution_session.active_run_id = trip.accepted_run_id
+        execution_session.status = "active"
+        if execution_session.started_at is None:
+            execution_session.started_at = datetime.now()
+    trip.state = "active"
+    db.commit()
+    return ExecutionStartOut.model_validate(
         {
-            "kind": "replan",
-            "trip_id": trip_id,
-            "candidate_ids": state.remaining_candidate_ids,
-            "must_visit": sorted(state.must_visit_ids),
-            "completed": ctx.completed_poi_ids,
-            "skipped": ctx.skipped_poi_ids,
-            "in_progress": ctx.in_progress_poi_id,
-            "satisfied_categories": sorted(state.satisfied_categories),
-            "cafe_requirement_already_met": state.cafe_requirement_already_met,
-            "departure": ctx.now_minute,
-            "departure_end": ctx.now_minute,
-            "origin_override": state.origin_override,
-            "weather_mode": state.trip.weather_mode,
-            "preferred_lunch_tags": pref_values["preferred_lunch_tags"],
-            "preferred_dinner_tags": pref_values["preferred_dinner_tags"],
-            "must_have_cafe": pref_values["must_have_cafe"],
-            "budget_band": pref_values["budget_band"],
-            "pace_style": pref_values["pace_style"],
+            "execution_session_id": execution_session.id,
+            "trip_state": trip.state,
+            "active_run_id": trip.accepted_run_id,
         }
     )
-    run = _persist_solver_run(
+
+
+@router.get("/{trip_id}/execution/bootstrap", response_model=ExecutionBootstrapOut)
+def execution_bootstrap(trip_id: int, db: Session = Depends(get_db)) -> ExecutionBootstrapOut:
+    trip = get_trip_or_error(db, trip_id)
+    return ExecutionBootstrapOut.model_validate(build_execution_bootstrap(db, trip))
+
+
+@router.post("/{trip_id}/execution/events", response_model=ExecutionEventOut)
+def post_execution_event(
+    trip_id: int, body: ExecutionEventCreateIn, db: Session = Depends(get_db)
+) -> ExecutionEventOut:
+    trip = get_trip_or_error(db, trip_id)
+    execution_session = get_execution_session_or_error(db, trip.id)
+    event = append_execution_event(
         db,
-        trip_id=trip_id,
-        input_hash=input_hash,
-        started_at=datetime.now(timezone.utc),
-        result=result,
-        summary={
-            "kind": "replan",
-            "reason_codes": result.reason_codes,
-            "feasible": result.feasible,
-            "ordered_poi_ids": result.ordered_poi_ids,
-            "shortlist_ids": pipeline.shortlist_ids,
-            "used_bucket": pipeline.used_bucket,
-            "used_traffic_matrix": pipeline.used_traffic_matrix,
-            "route_legs": [route_leg.model_dump() for route_leg in route_legs],
-        },
-    )
-    _persist_planned_stops(db, run.id, planned_stops)
-    _append_event(
-        db,
-        trip_id,
-        "replanned",
-        {
-            "feasible": result.feasible,
-            "reason_codes": result.reason_codes,
-            "current_lat": ctx.current_lat,
-            "current_lng": ctx.current_lng,
-            "in_progress_poi_id": ctx.in_progress_poi_id,
-        },
+        trip_id=trip.id,
+        execution_session_id=execution_session.id,
+        event_type=body.event_type,
+        payload=dict(body.payload or {}),
     )
     db.commit()
-    alternative_candidates = (
-        db.query(TripCandidate)
-        .filter(
-            TripCandidate.trip_id == trip_id,
-            TripCandidate.poi_id.in_(state.alternative_ids),
+    return ExecutionEventOut.model_validate(
+        {
+            "event_id": event.id,
+            "event_type": event.event_type,
+            "payload": dict(event.payload_json or {}),
+            "recorded_at": event.recorded_at.isoformat(),
+        }
+    )
+
+
+@router.post("/{trip_id}/execution/replan-preview", response_model=PreviewOut)
+async def execution_replan_preview(
+    trip_id: int, body: ReplanPreviewRequestIn, db: Session = Depends(get_db)
+) -> PreviewOut:
+    trip = get_trip_or_error(db, trip_id)
+    execution_session = get_execution_session_or_error(db, trip.id)
+    _check_workspace_version(trip, body.workspace_version)
+    if execution_session.active_run_id is None:
+        raise RequestContractError(
+            "REPLAN_NOT_ALLOWED",
+            "Execution has no active run.",
+            status_code=409,
         )
+    bootstrap = build_execution_bootstrap(db, trip)
+    completed_place_ids, in_progress_place_id, skipped_place_ids = _derive_execution_state(
+        bootstrap["events"]
+    )
+    current_context = dict(body.current_context or {})
+    if "current_lat" not in current_context or "current_lng" not in current_context:
+        if bootstrap["current_stop"] is not None:
+            current_context.setdefault("current_lat", bootstrap["current_stop"]["lat"])
+            current_context.setdefault("current_lng", bootstrap["current_stop"]["lng"])
+            current_context.setdefault("label", "現在地")
+    departure_min = int(current_context.get("current_minute") or _current_minute_for_trip(trip))
+    draft_candidate_patches = list(body.draft_candidate_patches)
+    visited_place_ids = list(
+        dict.fromkeys(
+            completed_place_ids
+            + skipped_place_ids
+            + ([in_progress_place_id] if in_progress_place_id is not None else [])
+        )
+    )
+    visited_candidates = (
+        db.query(TripCandidate)
+        .filter(TripCandidate.trip_id == trip.id, TripCandidate.place_id.in_(visited_place_ids))
         .all()
-        if state.alternative_ids
+        if visited_place_ids
         else []
     )
-    return _solve_response(
-        result,
-        planned_stops,
-        run_id=run.id,
-        used_bucket=pipeline.used_bucket,
-        used_traffic_matrix=pipeline.used_traffic_matrix,
-        shortlist_ids=pipeline.shortlist_ids,
-        route_legs=route_legs,
-        alternatives=[_serialize_candidate(candidate) for candidate in alternative_candidates],
+    draft_candidate_patches.extend(
+        {
+            "candidate_id": candidate.id,
+            "candidate_state": "excluded",
+            "locked_out": True,
+        }
+        for candidate in visited_candidates
+    )
+    suffix_solve = await generate_solve_payload(
+        db,
+        trip=trip,
+        draft_candidate_patches=draft_candidate_patches,
+        draft_rule_patches=body.draft_rule_patches,
+        draft_order_edits=body.draft_order_edits,
+        origin_override={
+            "label": current_context.get("label", "現在地"),
+            "lat": current_context["current_lat"],
+            "lng": current_context["current_lng"],
+        },
+        departure_override_min=departure_min,
+    )
+    solve_payload = _build_replan_payload(
+        active_solve=_active_run_payload(db, execution_session.active_run_id),
+        completed_place_ids=completed_place_ids,
+        current_label=current_context.get("label", "現在地"),
+        suffix_solve=suffix_solve,
+    )
+    preview = create_preview(
+        db,
+        trip=trip,
+        preview_kind="replan",
+        solve_payload=solve_payload,
+        draft_context=body.model_dump(),
+    )
+    db.commit()
+    return PreviewOut.model_validate(
+        {
+            "preview_id": preview.preview_id,
+            "workspace_version": trip.workspace_version,
+            "based_on_run_id": execution_session.active_run_id,
+            "solve": solve_payload,
+        }
     )
 
 
-@router.get("/{trip_id}/route-preview", response_model=RoutePreviewOut)
-def route_preview(trip_id: int, db: Session = Depends(get_db)) -> RoutePreviewOut:
-    solve = _get_latest_solve_snapshot(db, _get_trip_or_404(db, trip_id).id)
-    return RoutePreviewOut(solve=solve)
-
-
-@router.get(
-    "/{trip_id}/active-bootstrap",
-    response_model=ActiveTripBootstrapOut,
-)
-def active_bootstrap(
-    trip_id: int,
-    db: Session = Depends(get_db),
-) -> ActiveTripBootstrapOut:
-    trip = _get_trip_or_404(db, trip_id)
-    trip_detail = _serialize_trip_detail(db, trip)
-    events = (
-        db.query(TripExecutionEvent)
-        .filter(TripExecutionEvent.trip_id == trip_id)
-        .order_by(TripExecutionEvent.recorded_at.asc())
-        .all()
+@router.post("/{trip_id}/execution/replan", response_model=ReplanAcceptedOut)
+def accept_replan(trip_id: int, body: ReplanRequestIn, db: Session = Depends(get_db)) -> ReplanAcceptedOut:
+    trip = get_trip_or_error(db, trip_id)
+    execution_session = get_execution_session_or_error(db, trip.id)
+    preview = get_preview_or_error(db, body.preview_id)
+    assert_preview_matches_workspace(trip=trip, preview=preview, workspace_version=body.workspace_version)
+    _persist_preview_patches_to_workspace(trip, preview, db)
+    run = persist_solve_run(
+        db,
+        trip=trip,
+        run_kind="replan",
+        solve_payload=dict(preview.solve_json),
+        based_on_preview_id=preview.preview_id,
     )
-    pois = (
-        db.query(PoiMaster)
-        .filter(PoiMaster.primary_category.notin_(tuple(INTERNAL_TRIP_POI_CATEGORIES)))
-        .filter(PoiMaster.is_active.is_(True))
-        .order_by(PoiMaster.id)
-        .all()
+    trip.accepted_run_id = run.id
+    execution_session.active_run_id = run.id
+    append_execution_event(
+        db,
+        trip_id=trip.id,
+        execution_session_id=execution_session.id,
+        event_type="replanned",
+        payload={"preview_id": preview.preview_id, "active_run_id": run.id},
     )
-    return ActiveTripBootstrapOut(
-        trip=trip_detail,
-        events=[EventOut.model_validate(event) for event in events],
-        pois=[PoiOut.model_validate(poi) for poi in pois],
-        active_state=_derive_active_trip_state(trip_detail.latest_solve, events),
+    db.commit()
+    return ReplanAcceptedOut.model_validate(
+        {
+            "execution_session_id": execution_session.id,
+            "active_run_id": run.id,
+            "solve_run_id": run.id,
+            "accepted": True,
+            "solve": dict(preview.solve_json),
+        }
     )
-
-
-@router.get("/{trip_id}/solver-runs", response_model=list[SolverRunOut])
-def solver_runs(trip_id: int, db: Session = Depends(get_db)) -> list[SolverRunOut]:
-    _get_trip_or_404(db, trip_id)
-    runs = (
-        db.query(SolverRun)
-        .filter(SolverRun.trip_id == trip_id)
-        .order_by(SolverRun.id.desc())
-        .all()
-    )
-    return [SolverRunOut.model_validate(run) for run in runs]

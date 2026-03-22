@@ -46,7 +46,7 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
-from app.api.routes import pois, trips  # noqa: E402
+from app.api.routes import places, trips  # noqa: E402
 
-app.include_router(pois.router, prefix="/api", tags=["pois"])
+app.include_router(places.router, prefix="/api", tags=["places"])
 app.include_router(trips.router, prefix="/api", tags=["trips"])
