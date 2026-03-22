@@ -81,6 +81,56 @@ If one side still needs reconstruction logic, the contract is incomplete.
 - Add or update tests whenever a contract, failure mode, or error code changes.
 - Prefer asserting explicit failure codes/messages over generic success-path behavior.
 
+## Local Server Operations
+
+### Backend
+
+- Standard dev start:
+  - `cd backend`
+  - `source .venv/bin/activate`
+  - `alembic upgrade head`
+  - `python -m app.db.seed`
+  - `uvicorn app.main:app --reload --host 0.0.0.0 --port 8000`
+- If port `8000` is already occupied in the local machine, use:
+  - `uvicorn app.main:app --reload --host 0.0.0.0 --port 8001`
+- Code changes in Python files should be reflected automatically by `--reload`.
+- Fully restart the backend process instead of trusting hot reload when any of the following changes:
+  - startup/config validation
+  - environment variables
+  - migrations or DB initialization
+  - dependency wiring or app lifespan behavior
+- Health check after restart:
+  - `curl http://127.0.0.1:8000/health`
+  - or `curl http://127.0.0.1:8001/health`
+
+### Frontend
+
+- Standard dev start:
+  - `cd frontend`
+  - `npm run dev`
+- If port `3000` is already occupied, Next.js may move to `3001`. Confirm the actual port from server output.
+- React/Next code changes should usually reflect automatically during `npm run dev`.
+- Fully restart the frontend dev server when any of the following happens:
+  - stale chunk or asset 404s
+  - HMR loops or invalid hot-update messages
+  - client-side runtime config changes
+  - unexplained hydration mismatch after a refactor
+- If dev artifacts look corrupted, do a clean rebuild:
+  - `cd frontend`
+  - `rm -rf .next`
+  - `npm run build`
+  - `npm run dev`
+
+### Stable E2E Verification
+
+- For final browser verification, prefer production-style frontend serving instead of `next dev`:
+  - `cd frontend`
+  - `rm -rf .next`
+  - `npm run build`
+  - `PORT=3001 npm run start`
+- Keep backend running separately while doing this.
+- If production-style E2E uses a non-default frontend port, make sure `CORS_ORIGINS` includes that exact origin before testing.
+
 ## Review Checklist
 
 Before finishing a change, verify:
