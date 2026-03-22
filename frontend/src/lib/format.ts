@@ -1,14 +1,4 @@
-const FALLBACK_MESSAGES: Record<string, string> = {
-  no_lunch_candidate: "No lunch spot is available in the current candidate set.",
-  no_dinner_candidate: "No dinner spot is available in the current candidate set.",
-  no_sweets_candidate: "No cafe or sweets spot is available in the current candidate set.",
-  no_sunset_candidate: "No sunset candidate remains in the shortlist.",
-  no_feasible_route: "The current constraints do not allow a feasible route.",
-  rain_mode_removed_outdoor_candidates:
-    "Rain mode removed outdoor spots from the remaining graph.",
-  heuristic_fallback: "A fast fallback solve path was used for this graph.",
-  cbc_timeout: "The MIP solver timed out and fell back to a simpler route search.",
-};
+import type { SolvePayload } from "@/lib/types";
 
 export function formatMinute(minute: number | null | undefined): string {
   if (minute === null || minute === undefined) {
@@ -20,42 +10,39 @@ export function formatMinute(minute: number | null | undefined): string {
   return `${hours}:${minutes}`;
 }
 
-export function formatDuration(minute: number | null | undefined): string {
-  if (minute === null || minute === undefined) {
+export function formatDuration(minutes: number | null | undefined): string {
+  if (minutes === null || minutes === undefined) {
     return "--";
   }
-  const hours = Math.floor(minute / 60);
-  const minutes = minute % 60;
-  if (hours > 0 && minutes > 0) {
-    return `${hours}h ${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const rest = minutes % 60;
+  if (hours > 0 && rest > 0) {
+    return `${hours}時間${rest}分`;
   }
   if (hours > 0) {
-    return `${hours}h`;
+    return `${hours}時間`;
   }
-  return `${minutes}m`;
+  return `${rest}分`;
 }
 
-export function humanizeReason(code: string): string {
-  if (FALLBACK_MESSAGES[code]) {
-    return FALLBACK_MESSAGES[code];
+export function formatDistance(meters: number): string {
+  if (meters >= 1000) {
+    return `${(meters / 1000).toFixed(1)}km`;
   }
-  if (code.startsWith("must_visit_")) {
-    return `A must-visit stop became infeasible: ${code.replaceAll("_", " ")}`;
-  }
-  return code.replaceAll("_", " ");
+  return `${meters}m`;
 }
 
-export function localDateInputValue(date: Date = new Date()): string {
-  const year = String(date.getFullYear());
-  const month = String(date.getMonth() + 1).padStart(2, "0");
-  const day = String(date.getDate()).padStart(2, "0");
+export function dateInputValue(now: Date = new Date()): string {
+  const year = String(now.getFullYear());
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
   return `${year}-${month}-${day}`;
 }
 
-export function timeInputValue(minute: number): string {
-  const hours = String(Math.floor(minute / 60)).padStart(2, "0");
-  const minutes = String(minute % 60).padStart(2, "0");
-  return `${hours}:${minutes}`;
+export function timeInputValue(minutes: number): string {
+  const hours = String(Math.floor(minutes / 60)).padStart(2, "0");
+  const rest = String(minutes % 60).padStart(2, "0");
+  return `${hours}:${rest}`;
 }
 
 export function timeInputToMinute(value: string): number {
@@ -63,34 +50,14 @@ export function timeInputToMinute(value: string): number {
   return hours * 60 + minutes;
 }
 
-export function groupCategoryLabel(category: string): string {
-  const labels: Record<string, string> = {
-    lunch: "Lunch",
-    dinner: "Dinner",
-    sweets: "Cafe / Sweets",
-    sunset: "Sunset",
-    healing: "Healing",
-    sightseeing_active: "Active sightseeing",
-    sightseeing_relax: "Relaxed sightseeing",
-    hub: "Hub / indoor fallback",
-  };
-  return labels[category] || category;
-}
-
-export function appleMapsHref(
-  fromLat: number,
-  fromLng: number,
-  toLat: number,
-  toLng: number,
+export function summarizeSolveDiff(
+  accepted: SolvePayload | null,
+  compared: SolvePayload | null,
 ): string {
-  return `https://maps.apple.com/?saddr=${fromLat},${fromLng}&daddr=${toLat},${toLng}&dirflg=d`;
-}
-
-export function googleMapsHref(
-  fromLat: number,
-  fromLng: number,
-  toLat: number,
-  toLng: number,
-): string {
-  return `https://www.google.com/maps/dir/?api=1&origin=${fromLat},${fromLng}&destination=${toLat},${toLng}&travelmode=driving`;
+  if (!accepted || !compared) {
+    return "比較対象がありません。";
+  }
+  const driveDelta = compared.summary.total_drive_minutes - accepted.summary.total_drive_minutes;
+  const stopDelta = compared.selected_place_ids.length - accepted.selected_place_ids.length;
+  return `運転時間 ${driveDelta >= 0 ? "+" : ""}${driveDelta}分 / 立ち寄り ${stopDelta >= 0 ? "+" : ""}${stopDelta}件`;
 }

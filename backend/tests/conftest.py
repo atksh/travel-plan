@@ -9,9 +9,9 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import settings
 from app.db import database as database_module
 from app.db.seed import run_seed
-from app.services.google_places import RouteLegDetails
-from app.services import routing_costs
 from app.main import app
+from app.services import google_places as google_places_service
+from app.services import routing_costs as routing_costs_service
 
 
 @pytest.fixture(name="test_db_url")
@@ -29,12 +29,7 @@ def fixture_migrated_session_factory(
     monkeypatch.setattr(settings, "cors_origins", "http://localhost:3000")
 
     test_engine = database_module.build_engine(test_db_url)
-    testing_session_local = sessionmaker(
-        autocommit=False,
-        autoflush=False,
-        bind=test_engine,
-    )
-
+    testing_session_local = sessionmaker(autocommit=False, autoflush=False, bind=test_engine)
     monkeypatch.setattr(database_module, "engine", test_engine)
     monkeypatch.setattr(database_module, "SessionLocal", testing_session_local)
 
@@ -52,9 +47,7 @@ def fixture_migrated_session_factory(
 
 
 @pytest.fixture(name="db_session")
-def fixture_db_session(
-    migrated_session_factory: sessionmaker,
-) -> Generator[Session, None, None]:
+def fixture_db_session(migrated_session_factory: sessionmaker) -> Generator[Session, None, None]:
     session = migrated_session_factory()
     try:
         yield session
@@ -84,27 +77,28 @@ def fixture_client(
     ):
         del departure_bucket, traffic_aware, departure_time_iso, routing_preference
         return [
-            [0 if i == j else 12 for j in range(len(destinations))]
+            [0 if i == j else 15 + abs(i - j) for j in range(len(destinations))]
             for i in range(len(origins))
         ]
 
-    async def fake_refine_legs(legs):
-        return [
-            RouteLegDetails(
-                duration_minutes=12,
-                polyline="mock-polyline",
-                distance_meters=12000,
-            )
-            for _ in legs
-        ]
+    async def fake_compute_route_polyline(
+        origin,
+        destination,
+        departure_time_iso=None,
+        routing_preference="TRAFFIC_AWARE",
+    ):
+        del origin, destination, departure_time_iso, routing_preference
+        return google_places_service.RouteLegDetails(
+            duration_minutes=18,
+            polyline="encoded-polyline",
+            distance_meters=12000,
+        )
 
+    monkeypatch.setattr(google_places_service, "compute_route_matrix_minutes", fake_compute_route_matrix_minutes)
+    monkeypatch.setattr(google_places_service, "compute_route_polyline", fake_compute_route_polyline)
+    monkeypatch.setattr(routing_costs_service, "compute_route_matrix_minutes", fake_compute_route_matrix_minutes)
+    monkeypatch.setattr(routing_costs_service, "compute_route_polyline", fake_compute_route_polyline)
     app.dependency_overrides[database_module.get_db] = override_get_db
-    monkeypatch.setattr(
-        routing_costs,
-        "compute_route_matrix_minutes",
-        fake_compute_route_matrix_minutes,
-    )
-    monkeypatch.setattr(routing_costs, "refine_legs", fake_refine_legs)
     with TestClient(app) as test_client:
         yield test_client
 
@@ -112,15 +106,13 @@ def fixture_client(
 @pytest.fixture(name="trip_create_payload")
 def fixture_trip_create_payload() -> dict:
     return {
+        "title": "Sunday coast drive",
         "plan_date": "2026-03-21",
-        "origin_lat": 35.727,
-        "origin_lng": 139.791,
-        "origin_label": "Tokyo Iriya",
-        "dest_lat": 35.727,
-        "dest_lng": 139.791,
-        "dest_label": "Tokyo Iriya return",
+        "origin": {"label": "Home", "lat": 35.72, "lng": 139.79},
+        "destination": {"label": "Hotel", "lat": 35.45, "lng": 139.92},
         "departure_window_start_min": 480,
         "departure_window_end_min": 540,
-        "return_deadline_min": 1500,
-        "weather_mode": "normal",
+        "end_constraint": {"kind": "arrive_by", "minute_of_day": 1260},
+        "timezone": "Asia/Tokyo",
+        "context": {"weather": None, "traffic_profile": "default"},
     }
