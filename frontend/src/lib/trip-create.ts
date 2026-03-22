@@ -1,4 +1,4 @@
-import { timeInputToMinute } from "@/lib/format";
+import { timeInputToMinute, timeInputValue } from "@/lib/format";
 import type { PoiSummary } from "@/lib/types";
 
 export const DEFAULT_MUST_VISIT_POI_IDS = [1, 7] as const;
@@ -49,8 +49,59 @@ export type TripCreatePayload = {
   preferences: TripCreatePreferencesPayload;
 };
 
+export type SuggestedTripFrame = {
+  planDate: string;
+  departureStart: string;
+  departureEnd: string;
+  returnDeadline: string;
+};
+
+type TokyoDateParts = {
+  year: number;
+  month: number;
+  day: number;
+  hour: number;
+  minute: number;
+};
+
 function orderedUniquePoiIds(poiIds: number[]): number[] {
   return Array.from(new Set(poiIds));
+}
+
+export function buildSuggestedTripFrame(now: Date = new Date()): SuggestedTripFrame {
+  const departureStartMinute = 8 * 60;
+  const departureEndMinute = 9 * 60;
+  const returnDeadlineMinute = 25 * 60;
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Tokyo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  const parts = formatter.formatToParts(now);
+  const tokyoParts = Object.fromEntries(
+    parts
+      .filter((part) =>
+        ["year", "month", "day", "hour", "minute"].includes(part.type),
+      )
+      .map((part) => [part.type, Number(part.value)]),
+  ) as TokyoDateParts;
+  const currentMinute = tokyoParts.hour * 60 + tokyoParts.minute;
+  const planDate = new Date(
+    Date.UTC(tokyoParts.year, tokyoParts.month - 1, tokyoParts.day),
+  );
+  if (currentMinute >= departureStartMinute) {
+    planDate.setUTCDate(planDate.getUTCDate() + 1);
+  }
+  return {
+    planDate: planDate.toISOString().slice(0, 10),
+    departureStart: timeInputValue(departureStartMinute),
+    departureEnd: timeInputValue(departureEndMinute),
+    returnDeadline: timeInputValue(returnDeadlineMinute % (24 * 60)),
+  };
 }
 
 export function resolveDefaultMustVisitPoiIds(

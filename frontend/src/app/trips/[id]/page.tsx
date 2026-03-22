@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   appleMapsHref,
   formatDuration,
@@ -11,10 +11,10 @@ import {
   humanizeReason,
 } from "@/lib/format";
 import { api } from "@/lib/api";
-import { loadPlanCache, savePlanCache, useOnlineStatus } from "@/lib/offline-cache";
+import { useOnlineStatus } from "@/lib/offline-cache";
 import { buildRoutePoints } from "@/lib/stops";
 import { RouteMap } from "@/components/RouteMap";
-import type { CandidateOut, PlannedStopOut, PoiSummary, SolveResponse, TripDetailOut } from "@/lib/types";
+import type { CandidateOut, PlannedStopOut, SolveResponse, TripDetailOut } from "@/lib/types";
 
 function MapButtons({
   currentPoint,
@@ -52,15 +52,11 @@ function MapButtons({
 }
 
 function PlanTimelineSection({
-  trip,
   stops,
-  poiById,
 }: {
-  trip: TripDetailOut;
   stops: PlannedStopOut[];
-  poiById: Map<number, PoiSummary>;
 }) {
-  const points = buildRoutePoints(stops, trip, poiById);
+  const points = buildRoutePoints(stops);
   return (
     <section className="panel">
       <div className="section-heading">
@@ -232,54 +228,30 @@ export default function TripPage() {
   const params = useParams();
   const id = String(params.id);
   const [trip, setTrip] = useState<TripDetailOut | null>(null);
-  const [pois, setPois] = useState<PoiSummary[]>([]);
-  const [solve, setSolve] = useState<SolveResponse | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [useTraffic, setUseTraffic] = useState(true);
   const isOnline = useOnlineStatus();
 
   const loadTripData = useCallback(async () => {
-    try {
-      const [tripData, poiData] = await Promise.all([
-        api<TripDetailOut>(`/api/trips/${id}`),
-        api<PoiSummary[]>("/api/pois"),
-      ]);
-      setTrip(tripData);
-      setPois(poiData);
-    } catch (loadError) {
-      const cached = loadPlanCache(id);
-      if (!cached) {
-        throw loadError;
-      }
-      setTrip(cached.trip);
-      setPois(cached.pois);
-      setSolve(cached.solve);
-      setErr("Showing the cached plan because the app is offline.");
-    }
+    setErr(null);
+    const tripData = await api<TripDetailOut>(`/api/trips/${id}`);
+    setTrip(tripData);
   }, [id]);
 
   const runSolve = useCallback(
     async (traffic: boolean) => {
       if (!isOnline) {
-        const cached = loadPlanCache(id);
-        if (cached) {
-          setTrip(cached.trip);
-          setPois(cached.pois);
-          setSolve(cached.solve);
-          setErr("Offline mode is read-only. Cached plan loaded.");
-        }
+        setErr("Cannot solve while offline.");
         return;
       }
       setErr(null);
       setLoading(true);
       try {
-        setSolve(
-          await api<SolveResponse>(`/api/trips/${id}/solve`, {
-            method: "POST",
-            body: JSON.stringify({ use_traffic_matrix: traffic }),
-          }),
-        );
+        await api<SolveResponse>(`/api/trips/${id}/solve`, {
+          method: "POST",
+          body: JSON.stringify({ use_traffic_matrix: traffic }),
+        });
         await loadTripData();
       } catch (solveError) {
         setErr(solveError instanceof Error ? solveError.message : "Error");
@@ -291,35 +263,17 @@ export default function TripPage() {
   );
 
   const refreshAfterCandidateChange = useCallback(async () => {
-    await loadTripData();
     await runSolve(useTraffic);
-  }, [loadTripData, runSolve, useTraffic]);
+  }, [runSolve, useTraffic]);
 
   useEffect(() => {
-    if (!isOnline) {
-      const cached = loadPlanCache(id);
-      if (cached) {
-        setTrip(cached.trip);
-        setPois(cached.pois);
-        setSolve(cached.solve);
-        setErr("Offline mode is read-only. Cached plan loaded.");
-      }
-      return;
-    }
-    void (async () => {
-      await loadTripData();
-      await runSolve(useTraffic);
-    })();
-  }, [id, isOnline, loadTripData, runSolve, useTraffic]);
+    void loadTripData().catch((loadError) => {
+      setErr(loadError instanceof Error ? loadError.message : "Failed to load trip.");
+    });
+  }, [loadTripData]);
 
-  useEffect(() => {
-    if (trip && pois.length > 0) {
-      savePlanCache(id, { trip, solve, pois });
-    }
-  }, [id, pois, solve, trip]);
-
-  const poiById = useMemo(() => new Map(pois.map((poi) => [poi.id, poi])), [pois]);
-  const plannedStops = solve?.planned_stops ?? trip?.latest_route ?? [];
+  const latestSolve = trip?.latest_solve ?? null;
+  const plannedStops = latestSolve?.planned_stops ?? [];
 
   return (
     <main className="page-shell">
@@ -355,19 +309,19 @@ export default function TripPage() {
             </label>
             {!isOnline ? <div className="offline-badge">Offline read-only mode</div> : null}
           </div>
-          {solve ? (
+          {latestSolve ? (
             <div className="summary-row">
               <div className="summary-pill">
                 <span>Feasible</span>
-                <strong>{String(solve.feasible)}</strong>
+                <strong>{String(latestSolve.feasible)}</strong>
               </div>
               <div className="summary-pill">
                 <span>Objective</span>
-                <strong>{solve.objective ?? "—"}</strong>
+                <strong>{latestSolve.objective ?? "—"}</strong>
               </div>
               <div className="summary-pill">
                 <span>Solve time</span>
-                <strong>{solve.solve_ms} ms</strong>
+                <strong>{latestSolve.solve_ms} ms</strong>
               </div>
             </div>
           ) : null}
@@ -378,10 +332,13 @@ export default function TripPage() {
         {trip ? (
           <>
             <div className="split-panel">
-              <PlanTimelineSection trip={trip} stops={plannedStops} poiById={poiById} />
+              <PlanTimelineSection stops={plannedStops} />
               <div className="stack">
-                <RouteMap trip={trip} stops={plannedStops} poiById={poiById} />
-                <ReasonListSection reasonCodes={solve?.reason_codes ?? []} />
+                <RouteMap
+                  stops={plannedStops}
+                  routeLegs={latestSolve?.route_legs ?? []}
+                />
+                <ReasonListSection reasonCodes={latestSolve?.reason_codes ?? []} />
               </div>
             </div>
 
@@ -409,8 +366,8 @@ export default function TripPage() {
                   <div className="candidate-item">
                     <div className="candidate-title">Latest solver run</div>
                     <div className="timeline-meta">
-                      {trip.latest_solver_run
-                        ? `${trip.latest_solver_run.solve_ms} ms`
+                      {trip.latest_solve
+                        ? `${trip.latest_solve.solve_ms} ms`
                         : "No run stored yet"}
                     </div>
                   </div>

@@ -38,16 +38,25 @@ export type PlannedStopOut = {
   id?: number | null;
   sequence_order: number;
   poi_id: number | null;
-  poi_name: string | null;
-  label?: string | null;
+  poi_name: string;
+  label: string;
   node_kind: string;
-  lat?: number | null;
-  lng?: number | null;
-  arrival_min: number | null;
-  departure_min: number | null;
-  stay_min: number | null;
+  lat: number;
+  lng: number;
+  arrival_min: number;
+  departure_min: number;
+  stay_min: number;
   leg_from_prev_min: number | null;
+  leg_polyline?: string | null;
   status: string;
+};
+
+export type RouteLegOut = {
+  from_sequence_order: number;
+  to_sequence_order: number;
+  duration_minutes: number;
+  distance_meters: number | null;
+  encoded_polyline: string;
 };
 
 export type SolverRunOut = {
@@ -55,6 +64,20 @@ export type SolverRunOut = {
   objective_value: number | null;
   infeasible_reason: string | null;
   solve_ms: number;
+};
+
+export type SolveSnapshotOut = {
+  feasible: boolean;
+  objective: number | null;
+  ordered_poi_ids: number[];
+  reason_codes: string[];
+  solve_ms: number;
+  solver_run_id: number | null;
+  used_bucket: string;
+  used_traffic_matrix: boolean;
+  shortlist_ids: number[];
+  planned_stops: PlannedStopOut[];
+  route_legs: RouteLegOut[];
 };
 
 export type TripDetailOut = {
@@ -73,23 +96,15 @@ export type TripDetailOut = {
   weather_mode: string;
   preference_profile: TripPreferenceOut | null;
   candidates: CandidateOut[];
-  latest_route: PlannedStopOut[];
-  latest_solver_run: SolverRunOut | null;
+  latest_solve: SolveSnapshotOut | null;
 };
 
-export type SolveResponse = {
-  feasible: boolean;
-  objective: number | null;
-  ordered_poi_ids: number[];
-  reason_codes: string[];
-  solve_ms: number;
-  planned_stops: PlannedStopOut[];
-  solver_run_id: number | null;
+export type SolveResponse = SolveSnapshotOut & {
   alternatives: CandidateOut[];
 };
 
 export type RoutePreviewOut = {
-  stops: PlannedStopOut[];
+  solve: SolveSnapshotOut | null;
 };
 
 export type EventOut = {
@@ -97,4 +112,18 @@ export type EventOut = {
   event_type: string;
   payload_json: Record<string, unknown> | null;
   recorded_at: string;
+};
+
+export type ActiveTripStateOut = {
+  completed_poi_ids: number[];
+  in_progress_poi_id: number | null;
+  current_stop: PlannedStopOut | null;
+  next_stop: PlannedStopOut | null;
+};
+
+export type ActiveTripBootstrapOut = {
+  trip: TripDetailOut;
+  events: EventOut[];
+  pois: PoiSummary[];
+  active_state: ActiveTripStateOut;
 };

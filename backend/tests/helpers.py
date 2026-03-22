@@ -11,8 +11,9 @@ from app.db.seed import (
     resolve_seed_poi_ids,
     run_seed,
 )
-from app.models.poi import PoiMaster, PoiPlanningProfile, PoiTag, PoiTagLink
+from app.models.poi import PoiMaster, PoiOpeningRule, PoiPlanningProfile, PoiTag, PoiTagLink
 from app.models.trip import TripCandidate, TripPlan, TripPreferenceProfile
+from app.services.geo import estimate_drive_minutes
 from app.solver.model import SolverInput, SolverResult, solve_trip
 
 
@@ -104,6 +105,32 @@ def trip_solver_input(
         trip.origin_lat,
         trip.origin_lng,
     )
+    poi_rows = db.query(PoiMaster).filter(PoiMaster.id.in_(candidate_ids)).all()
+    poi_by_id = {poi.id: poi for poi in poi_rows}
+    matrix_node_ids = [-1, *candidate_ids, -2]
+    coords_by_node = {
+        -1: (origin_lat, origin_lng),
+        -2: (trip.dest_lat, trip.dest_lng),
+        **{
+            poi_id: (poi_by_id[poi_id].lat, poi_by_id[poi_id].lng)
+            for poi_id in candidate_ids
+            if poi_id in poi_by_id
+        },
+    }
+    travel_matrix = [
+        [
+            0
+            if origin_node == destination_node
+            else estimate_drive_minutes(
+                coords_by_node[origin_node][0],
+                coords_by_node[origin_node][1],
+                coords_by_node[destination_node][0],
+                coords_by_node[destination_node][1],
+            )
+            for destination_node in matrix_node_ids
+        ]
+        for origin_node in matrix_node_ids
+    ]
     return SolverInput(
         origin_lat=origin_lat,
         origin_lng=origin_lng,
@@ -147,6 +174,8 @@ def trip_solver_input(
         ),
         budget_band=trip.preference_profile.budget_band if trip.preference_profile else None,
         pace_style=trip.preference_profile.pace_style if trip.preference_profile else "balanced",
+        matrix_node_ids=matrix_node_ids,
+        travel_matrix=travel_matrix,
     )
 
 
@@ -183,6 +212,7 @@ def add_custom_poi(
     meal_window_end_min: int | None = None,
     is_indoor: bool = True,
     price_band: str | None = None,
+    with_default_opening_rule: bool = True,
 ) -> PoiMaster:
     poi = PoiMaster(
         name=name,
@@ -211,6 +241,21 @@ def add_custom_poi(
             utility_default=utility_default,
         )
     )
+    if with_default_opening_rule:
+        default_open_minute = meal_window_start_min or 9 * 60
+        default_close_minute = meal_window_end_min or 18 * 60
+        db.add(
+            PoiOpeningRule(
+                poi_id=poi.id,
+                weekday=None,
+                open_minute=default_open_minute,
+                close_minute=default_close_minute,
+                valid_from=None,
+                valid_to=None,
+                holiday_note=None,
+                last_admission_minute=None,
+            )
+        )
     for slug in tags or []:
         tag = db.query(PoiTag).filter(PoiTag.slug == slug).one_or_none()
         if tag is None:

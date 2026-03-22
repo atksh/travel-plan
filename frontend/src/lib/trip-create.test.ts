@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  buildSuggestedTripFrame,
   buildTripCreatePayload,
   resolveDefaultMustVisitPoiIds,
 } from "@/lib/trip-create";
@@ -42,6 +43,26 @@ describe("buildTripCreatePayload", () => {
       must_have_cafe: true,
       budget_band: "premium",
       pace_style: "packed",
+    });
+  });
+});
+
+describe("buildSuggestedTripFrame", () => {
+  it("uses today when the default departure is still in the future", () => {
+    expect(buildSuggestedTripFrame(new Date("2026-03-21T22:30:00Z"))).toEqual({
+      planDate: "2026-03-22",
+      departureStart: "08:00",
+      departureEnd: "09:00",
+      returnDeadline: "01:00",
+    });
+  });
+
+  it("uses tomorrow when the default departure would already be in the past in JST", () => {
+    expect(buildSuggestedTripFrame(new Date("2026-03-22T09:30:00Z"))).toEqual({
+      planDate: "2026-03-23",
+      departureStart: "08:00",
+      departureEnd: "09:00",
+      returnDeadline: "01:00",
     });
   });
 });

@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
+from app.errors import StateContractError
 from app.models.poi import PoiMaster
 from app.models.trip import TripCandidate, TripExecutionEvent, TripPlan
 from app.services.geo import estimate_drive_minutes
-from app.services.routing_costs import prune_candidates
-from app.solver.model import SolverInput, SolverResult, solve_trip
+from app.services.routing_costs import build_solve_pipeline, prune_candidates
+from app.solver.model import SolverResult
 
 JST = timezone(timedelta(hours=9))
 
@@ -242,40 +244,29 @@ def annotate_must_visit_failure(
 def replan_trip(session: Session, ctx: ReplanContext) -> SolverResult:
     state = prepare_replan_state(session, ctx)
     pref = state.trip.preference_profile
-    start_lat, start_lng = state.origin_override or (
-        state.trip.origin_lat,
-        state.trip.origin_lng,
-    )
-    result = solve_trip(
-        session,
-        SolverInput(
-            origin_lat=start_lat,
-            origin_lng=start_lng,
-            dest_lat=state.trip.dest_lat,
-            dest_lng=state.trip.dest_lng,
+    if pref is None:
+        raise StateContractError(
+            "TRIP_PREFERENCE_PROFILE_MISSING",
+            "Trip is missing a preference profile.",
+            details={"trip_id": state.trip.id},
+        )
+    pipeline = asyncio.run(
+        build_solve_pipeline(
+            session,
+            state.trip,
+            use_traffic_matrix=False,
+            origin_override=state.origin_override,
             departure_start_min=ctx.now_minute,
             departure_window_end_min=ctx.now_minute,
-            return_deadline_min=state.trip.return_deadline_min,
-            candidate_poi_ids=state.remaining_candidate_ids,
+            candidate_ids=state.remaining_candidate_ids,
             must_visit=state.must_visit_ids,
-            driving_penalty_weight=(
-                pref.driving_penalty_weight if pref is not None else 0.05
-            ),
-            weather_mode=state.trip.weather_mode,
-            plan_date=state.trip.plan_date,
-            excluded_poi_ids=state.excluded_ids,
+            excluded_ids=state.excluded_ids,
             utility_overrides=state.utility_overrides,
-            max_continuous_drive_minutes=(
-                pref.max_continuous_drive_minutes if pref is not None else 120
-            ),
-            preferred_lunch_tags=set(pref.preferred_lunch_tags if pref is not None else []),
-            preferred_dinner_tags=set(pref.preferred_dinner_tags if pref is not None else []),
-            must_have_cafe=pref.must_have_cafe if pref is not None else False,
+            max_continuous_drive_minutes=pref.max_continuous_drive_minutes,
             satisfied_categories=state.satisfied_categories,
             cafe_requirement_already_met=state.cafe_requirement_already_met,
-            budget_band=pref.budget_band if pref is not None else None,
-            pace_style=pref.pace_style if pref is not None else "balanced",
-        ),
+        )
     )
+    result = pipeline.solver_result
     annotate_must_visit_failure(session, result, state, now_minute=ctx.now_minute)
     return result

@@ -6,9 +6,11 @@ import {
   AdvancedMarker,
   Map,
   useMap,
+  useMapsLibrary,
 } from "@vis.gl/react-google-maps";
 import { buildRoutePoints } from "@/lib/stops";
-import type { PoiSummary, TripDetailOut, PlannedStopOut } from "@/lib/types";
+import { GOOGLE_MAPS_API_KEY } from "@/lib/runtime-config";
+import type { RouteLegOut, PlannedStopOut } from "@/lib/types";
 
 type GoogleWindow = Window & {
   google?: {
@@ -16,30 +18,52 @@ type GoogleWindow = Window & {
       Polyline: new (options: Record<string, unknown>) => {
         setMap: (map: unknown | null) => void;
       };
+      geometry?: {
+        encoding?: {
+          decodePath: (encodedPath: string) => unknown[];
+        };
+      };
     };
   };
 };
 
 type RouteMapProps = {
-  trip: TripDetailOut;
   stops: PlannedStopOut[];
-  poiById: Map<number, PoiSummary>;
+  routeLegs: RouteLegOut[];
 };
 
 function RoutePolyline({
   points,
+  stops,
+  routeLegs,
 }: {
   points: Array<{ lat: number; lng: number }>;
+  stops: PlannedStopOut[];
+  routeLegs: RouteLegOut[];
 }) {
   const map = useMap();
+  const geometryLibrary = useMapsLibrary("geometry");
 
   useEffect(() => {
     const googleWindow = window as GoogleWindow;
     if (!map || !googleWindow.google || points.length < 2) {
       return undefined;
     }
+    const decodedPath: unknown[] = [];
+    const decodePath =
+      geometryLibrary && googleWindow.google.maps.geometry?.encoding?.decodePath
+        ? googleWindow.google.maps.geometry.encoding.decodePath
+        : null;
+
+    for (const routeLeg of routeLegs) {
+      if (decodePath) {
+        decodedPath.push(...decodePath(routeLeg.encoded_polyline));
+        continue;
+      }
+    }
+
     const polyline = new googleWindow.google.maps.Polyline({
-      path: points,
+      path: decodedPath.length >= 2 ? decodedPath : points,
       strokeColor: "#7de2cf",
       strokeOpacity: 0.95,
       strokeWeight: 4,
@@ -48,23 +72,16 @@ function RoutePolyline({
     return () => {
       polyline.setMap(null);
     };
-  }, [map, points]);
+  }, [geometryLibrary, map, points, routeLegs, stops]);
 
   return null;
 }
 
-export function RouteMap({ trip, stops, poiById }: RouteMapProps) {
-  const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
-  const points = buildRoutePoints(stops, trip, poiById);
+export function RouteMap({ stops, routeLegs }: RouteMapProps) {
+  const points = buildRoutePoints(stops);
   const center = useMemo(() => {
-    return (
-      points[0] || {
-        lat: trip.origin_lat,
-        lng: trip.origin_lng,
-        label: trip.origin_label,
-      }
-    );
-  }, [points, trip]);
+    return points[0];
+  }, [points]);
 
   if (points.length === 0) {
     return (
@@ -77,30 +94,6 @@ export function RouteMap({ trip, stops, poiById }: RouteMapProps) {
     );
   }
 
-  if (!apiKey) {
-    return (
-      <section className="map-panel">
-        <div className="section-heading">
-          <h2>Map</h2>
-          <p>
-            Add <code>NEXT_PUBLIC_GOOGLE_MAPS_API_KEY</code> to render the live
-            Google map. The route points are ready.
-          </p>
-        </div>
-        <div className="stack">
-          {points.map((point) => (
-            <div key={`${point.label}-${point.lat}-${point.lng}`} className="candidate-item">
-              <div className="candidate-title">{point.label}</div>
-              <div className="timeline-meta">
-                {point.lat.toFixed(4)}, {point.lng.toFixed(4)}
-              </div>
-            </div>
-          ))}
-        </div>
-      </section>
-    );
-  }
-
   return (
     <section className="map-panel">
       <div className="section-heading">
@@ -108,7 +101,7 @@ export function RouteMap({ trip, stops, poiById }: RouteMapProps) {
         <p>Live Google Maps view of the current route order.</p>
       </div>
       <div style={{ height: "420px", borderRadius: "18px", overflow: "hidden" }}>
-        <APIProvider apiKey={apiKey}>
+        <APIProvider apiKey={GOOGLE_MAPS_API_KEY} libraries={["geometry"]}>
           <Map
             defaultCenter={{ lat: center.lat, lng: center.lng }}
             defaultZoom={9}
@@ -138,7 +131,7 @@ export function RouteMap({ trip, stops, poiById }: RouteMapProps) {
                 </div>
               </AdvancedMarker>
             ))}
-            <RoutePolyline points={points} />
+            <RoutePolyline points={points} stops={stops} routeLegs={routeLegs} />
           </Map>
         </APIProvider>
       </div>

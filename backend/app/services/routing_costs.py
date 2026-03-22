@@ -1,4 +1,4 @@
-"""Routing cost service with shortlist, cache, matrix calls, and leg refinement."""
+"""Routing cost service with shortlist, strict matrix calls, and leg refinement."""
 
 from __future__ import annotations
 
@@ -10,12 +10,11 @@ from typing import Any, Sequence
 
 from sqlalchemy.orm import Session
 
-from app.config import settings
+from app.errors import StateContractError
 from app.models.poi import PoiMaster
 from app.models.routing_cache import RoutingCacheEntry, RoutingRequestLog
 from app.models.trip import TripCandidate, TripPlan
-from app.services.geo import estimate_drive_minutes
-from app.services.google_places import compute_route_matrix_minutes
+from app.services.google_places import RouteLegDetails, compute_route_matrix_minutes
 from app.solver.model import SolverInput, SolverResult, pace_shortlist_max, solve_trip
 from app.solver.refine import LegRefinement, refine_legs
 
@@ -29,10 +28,10 @@ TRAFFIC_INTENSIVE_BUCKETS = {"sunset", "dinner"}
 
 @dataclass
 class BaselineMatrixResult:
-    """Travel time matrix in minutes (integer) and node order."""
+    """Route node order and coordinates."""
 
     node_ids: list[int]
-    matrix: list[list[int]]
+    coords_by_node: dict[int, tuple[float, float]]
 
 
 @dataclass
@@ -50,13 +49,16 @@ def _hash_coords(lat: float, lng: float) -> str:
     return hashlib.sha256(f"{lat:.5f},{lng:.5f}".encode()).hexdigest()[:32]
 
 
-def _minute_to_iso(plan_date: date, minute_of_day: int) -> str:
+def _minute_to_datetime(plan_date: date, minute_of_day: int) -> datetime:
     days, minute = divmod(minute_of_day, 24 * 60)
     hour, minute = divmod(minute, 60)
-    return (
-        datetime.combine(plan_date, time(hour=0, minute=0), JST)
-        + timedelta(days=days, hours=hour, minutes=minute)
-    ).isoformat()
+    return datetime.combine(plan_date, time(hour=0, minute=0), JST) + timedelta(
+        days=days, hours=hour, minutes=minute
+    )
+
+
+def _minute_to_iso(plan_date: date, minute_of_day: int) -> str:
+    return _minute_to_datetime(plan_date, minute_of_day).isoformat()
 
 
 def _bucket_departure_minutes(base_departure_min: int) -> dict[str, int]:
@@ -122,28 +124,30 @@ def build_baseline_matrix(
     dest_lat: float,
     dest_lng: float,
 ) -> BaselineMatrixResult:
-    """Build [start, poi..., end] matrix using cheap estimates."""
+    """Build [start, poi..., end] node set with strict POI validation."""
     poi_by_id = {
         poi.id: poi
         for poi in session.query(PoiMaster).filter(PoiMaster.id.in_(list(ordered_poi_ids))).all()
     }
+    missing_poi_ids = [poi_id for poi_id in ordered_poi_ids if poi_id not in poi_by_id]
+    if missing_poi_ids:
+        raise StateContractError(
+            "ROUTE_GRAPH_POI_MISSING",
+            "Unable to build route graph because some shortlist POIs are missing.",
+            details={"missing_poi_ids": missing_poi_ids},
+        )
     node_ids = [-1, *ordered_poi_ids, -2]
-    coords = [
-        (origin_lat, origin_lng),
-        *[(poi_by_id[poi_id].lat, poi_by_id[poi_id].lng) for poi_id in ordered_poi_ids],
-        (dest_lat, dest_lng),
-    ]
+    coords_by_node = {
+        -1: (origin_lat, origin_lng),
+        -2: (dest_lat, dest_lng),
+        **{
+            poi_id: (poi_by_id[poi_id].lat, poi_by_id[poi_id].lng)
+            for poi_id in ordered_poi_ids
+        },
+    }
     return BaselineMatrixResult(
         node_ids=node_ids,
-        matrix=[
-            [
-                0
-                if i == j
-                else estimate_drive_minutes(start[0], start[1], end[0], end[1])
-                for j, end in enumerate(coords)
-            ]
-            for i, start in enumerate(coords)
-        ],
+        coords_by_node=coords_by_node,
     )
 
 
@@ -373,7 +377,6 @@ async def _build_bucket_matrix(
     bucket: str,
     departure_min: int,
     *,
-    use_traffic_matrix: bool,
     routing_preference: str,
 ) -> list[list[int]]:
     size = len(node_ids)
@@ -408,16 +411,17 @@ async def _build_bucket_matrix(
             notes="all matrix elements served from cache",
         )
         return matrix
-    if not use_traffic_matrix or not settings.google_maps_api_key:
-        return _estimate_matrix(node_ids, coords_by_node)
-
     started = time_module.perf_counter()
     api_matrix = await compute_route_matrix_minutes(
         [coords_by_node[node_id] for node_id in node_ids],
         [coords_by_node[node_id] for node_id in node_ids],
         departure_bucket=bucket,
         traffic_aware=routing_preference != "TRAFFIC_UNAWARE",
-        departure_time_iso=_minute_to_iso(trip.plan_date, departure_min),
+        departure_time_iso=(
+            None
+            if routing_preference == "TRAFFIC_UNAWARE"
+            else _minute_to_iso(trip.plan_date, departure_min)
+        ),
         routing_preference=routing_preference,
     )
     latency_ms = int((time_module.perf_counter() - started) * 1000)
@@ -517,6 +521,12 @@ async def build_solve_pipeline(
     utility_overrides = default_utilities if utility_overrides is None else utility_overrides
 
     preference_profile = trip.preference_profile
+    if preference_profile is None:
+        raise StateContractError(
+            "TRIP_PREFERENCE_PROFILE_MISSING",
+            "Trip is missing a preference profile.",
+            details={"trip_id": trip.id},
+        )
     departure_min = (
         departure_start_min
         if departure_start_min is not None
@@ -539,7 +549,7 @@ async def build_solve_pipeline(
     effective_must_visit = {poi_id for poi_id in must_visit if poi_id in pruned_ids}
     removed_must_visit = sorted(must_visit - effective_must_visit)
     shortlist_max = pace_shortlist_max(
-        preference_profile.pace_style if preference_profile is not None else "balanced"
+        preference_profile.pace_style
     )
     shortlist_ids = _ensure_required_categories(
         session,
@@ -558,26 +568,29 @@ async def build_solve_pipeline(
         trip.dest_lat,
         trip.dest_lng,
     )
-    coords_by_node = {
-        -1: (start_lat, start_lng),
-        -2: (trip.dest_lat, trip.dest_lng),
-        **{
-            poi.id: (poi.lat, poi.lng)
-            for poi in session.query(PoiMaster).filter(PoiMaster.id.in_(shortlist_ids)).all()
-        },
+    coords_by_node = baseline.coords_by_node
+    poi_rows = session.query(PoiMaster).filter(PoiMaster.id.in_(shortlist_ids)).all()
+    category_by_poi_id = {poi.id: poi.primary_category for poi in poi_rows}
+    used_traffic = use_traffic_matrix
+    departure_preference = (
+        _routing_preference("departure", len(shortlist_ids))
+        if used_traffic
+        else "TRAFFIC_UNAWARE"
+    )
+    matrix_by_bucket = {
+        "departure": await _build_bucket_matrix(
+            session,
+            trip,
+            baseline.node_ids,
+            coords_by_node,
+            "departure",
+            departure_min,
+            routing_preference=departure_preference,
+        )
     }
-    category_by_poi_id = {
-        poi_id: poi.primary_category
-        for poi_id, poi in {
-            poi.id: poi
-            for poi in session.query(PoiMaster).filter(PoiMaster.id.in_(shortlist_ids)).all()
-        }.items()
-    }
-    used_traffic = use_traffic_matrix and bool(settings.google_maps_api_key)
-    matrix_by_bucket = {"departure": baseline.matrix}
     if used_traffic:
         bucket_minutes = _bucket_departure_minutes(departure_min)
-        for bucket in DEPARTURE_BUCKETS:
+        for bucket in DEPARTURE_BUCKETS[1:]:
             matrix_by_bucket[bucket] = await _build_bucket_matrix(
                 session,
                 trip,
@@ -585,7 +598,6 @@ async def build_solve_pipeline(
                 coords_by_node,
                 bucket,
                 bucket_minutes[bucket],
-                use_traffic_matrix=used_traffic,
                 routing_preference=_routing_preference(bucket, len(shortlist_ids)),
             )
 
@@ -599,32 +611,20 @@ async def build_solve_pipeline(
         return_deadline_min=trip.return_deadline_min,
         candidate_poi_ids=shortlist_ids,
         must_visit=effective_must_visit,
-        driving_penalty_weight=(
-            preference_profile.driving_penalty_weight if preference_profile else 0.05
-        ),
+        driving_penalty_weight=preference_profile.driving_penalty_weight,
         weather_mode=trip.weather_mode,
         plan_date=trip.plan_date,
         excluded_poi_ids=excluded_ids,
         utility_overrides=utility_overrides,
-        max_continuous_drive_minutes=(
-            max_continuous_drive_minutes
-            or (
-                preference_profile.max_continuous_drive_minutes
-                if preference_profile
-                else 120
-            )
-        ),
-        preferred_lunch_tags=set(
-            preference_profile.preferred_lunch_tags if preference_profile else []
-        ),
-        preferred_dinner_tags=set(
-            preference_profile.preferred_dinner_tags if preference_profile else []
-        ),
-        must_have_cafe=preference_profile.must_have_cafe if preference_profile else False,
+        max_continuous_drive_minutes=max_continuous_drive_minutes
+        or preference_profile.max_continuous_drive_minutes,
+        preferred_lunch_tags=set(preference_profile.preferred_lunch_tags or []),
+        preferred_dinner_tags=set(preference_profile.preferred_dinner_tags or []),
+        must_have_cafe=preference_profile.must_have_cafe,
         satisfied_categories=satisfied_categories or set(),
         cafe_requirement_already_met=cafe_requirement_already_met,
-        budget_band=preference_profile.budget_band if preference_profile else None,
-        pace_style=preference_profile.pace_style if preference_profile else "balanced",
+        budget_band=preference_profile.budget_band,
+        pace_style=preference_profile.pace_style,
         matrix_node_ids=baseline.node_ids,
         travel_matrix=matrix_by_bucket["departure"],
     )
@@ -640,21 +640,32 @@ async def build_solve_pipeline(
             solver_input.travel_matrix = matrix_by_bucket[selected_bucket]
             solver_result = solve_trip(session, solver_input)
 
-    refined_legs: list[dict[str, Any]] = []
-    if used_traffic and solver_result.feasible and solver_result.ordered_poi_ids:
+    refined_legs: list[RouteLegDetails] = []
+    if solver_result.feasible and solver_result.ordered_poi_ids:
         route_nodes = [-1, *solver_result.ordered_poi_ids, -2]
+        departure_times = _departure_times(solver_result, departure_min)
+        routing_preference = (
+            _routing_preference(selected_bucket, len(shortlist_ids))
+            if used_traffic
+            else "TRAFFIC_UNAWARE"
+        )
         refinement_requests = [
             LegRefinement(
                 from_lat=coords_by_node[from_node][0],
                 from_lng=coords_by_node[from_node][1],
                 to_lat=coords_by_node[to_node][0],
                 to_lng=coords_by_node[to_node][1],
-                departure_time_iso=_minute_to_iso(
-                    trip.plan_date,
-                    _departure_times(solver_result, departure_min)[index]
-                    if index < len(_departure_times(solver_result, departure_min))
-                    else departure_min,
+                departure_time_iso=(
+                    None
+                    if routing_preference == "TRAFFIC_UNAWARE"
+                    else _minute_to_iso(
+                        trip.plan_date,
+                        departure_times[index]
+                        if index < len(departure_times)
+                        else departure_min,
+                    )
                 ),
+                routing_preference=routing_preference,
             )
             for index, (from_node, to_node) in enumerate(zip(route_nodes, route_nodes[1:]))
         ]
@@ -674,7 +685,7 @@ async def build_solve_pipeline(
         for index, refined_leg in enumerate(refined_legs):
             if index + 1 >= len(route_nodes):
                 continue
-            new_duration = int(refined_leg.get("duration_minutes", 0))
+            new_duration = refined_leg.duration_minutes
             if new_duration <= 0:
                 continue
             from_node, to_node = route_nodes[index], route_nodes[index + 1]
@@ -684,9 +695,8 @@ async def build_solve_pipeline(
         if material_shift:
             solver_input.travel_matrix = refined_matrix
             refined_result = solve_trip(session, solver_input)
-            if refined_result.feasible:
-                solver_result = refined_result
-                matrix_by_bucket[selected_bucket] = refined_matrix
+            solver_result = refined_result
+            matrix_by_bucket[selected_bucket] = refined_matrix
 
     if trip.weather_mode == "rain" and removed_must_visit:
         solver_result.reason_codes = list(

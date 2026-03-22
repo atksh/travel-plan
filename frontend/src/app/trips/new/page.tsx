@@ -10,11 +10,10 @@ import {
 } from "react";
 import {
   groupCategoryLabel,
-  localDateInputValue,
-  timeInputValue,
 } from "@/lib/format";
 import { api } from "@/lib/api";
 import {
+  buildSuggestedTripFrame,
   buildTripCreatePayload,
   resolveDefaultMustVisitPoiIds,
   type TripCreateFormState,
@@ -51,9 +50,9 @@ function buildInitialFormState(): TripCreateFormState {
     destLabel: DEFAULT_DESTINATION.label,
     destLat: String(DEFAULT_DESTINATION.lat),
     destLng: String(DEFAULT_DESTINATION.lng),
-    departureStart: timeInputValue(8 * 60),
-    departureEnd: timeInputValue(9 * 60),
-    returnDeadline: timeInputValue((25 * 60) % (24 * 60)),
+    departureStart: "08:00",
+    departureEnd: "09:00",
+    returnDeadline: "01:00",
     weatherMode: "normal",
     drivingPenaltyWeight: 0.05,
     maxContinuousDriveMinutes: 120,
@@ -188,8 +187,17 @@ export default function NewTripPage() {
   }, []);
 
   useEffect(() => {
+    const suggestedTripFrame = buildSuggestedTripFrame();
     setForm((current) =>
-      current.planDate ? current : { ...current, planDate: localDateInputValue() },
+      current.planDate
+        ? current
+        : {
+            ...current,
+            planDate: suggestedTripFrame.planDate,
+            departureStart: suggestedTripFrame.departureStart,
+            departureEnd: suggestedTripFrame.departureEnd,
+            returnDeadline: suggestedTripFrame.returnDeadline,
+          },
     );
   }, []);
 

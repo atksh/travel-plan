@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
 from app.db.database import get_db
+from app.errors import RequestContractError
 from app.models.poi import (
     PoiMaster,
     PoiOpeningRule,
@@ -13,7 +14,14 @@ from app.models.poi import (
     PoiTagLink,
 )
 from app.models.source import PoiSourceSnapshot
-from app.schemas.poi import PoiDetailOut, PoiImportBody, PoiOut, PoiPatch, PoiSearchBody
+from app.schemas.poi import (
+    PoiDetailOut,
+    PoiImportBody,
+    PoiOut,
+    PoiPatch,
+    PoiSearchBody,
+    PoiSearchResponseOut,
+)
 from app.services.google_places import get_place_details, search_places_text
 
 router = APIRouter(prefix="/pois", tags=["pois"])
@@ -61,7 +69,10 @@ def _infer_category(
     if category_override is not None:
         return category_override
     if not primary_type:
-        return "hub"
+        raise RequestContractError(
+            "PLACE_PRIMARY_TYPE_MISSING",
+            "Google Place primaryType is required for import.",
+        )
     lowered = primary_type.lower()
     if "cafe" in lowered or "bakery" in lowered:
         return "sweets"
@@ -73,7 +84,13 @@ def _infer_category(
         return "lunch"
     if "museum" in lowered or "gallery" in lowered or "aquarium" in lowered:
         return "hub"
-    return "sightseeing_relax"
+    if any(keyword in lowered for keyword in ("park", "pier", "beach", "trail", "lighthouse")):
+        return "sightseeing_relax"
+    raise RequestContractError(
+        "PLACE_PRIMARY_TYPE_UNSUPPORTED",
+        "Google Place primaryType is not supported for import.",
+        details={"primary_type": primary_type},
+    )
 
 
 def _infer_stay_bounds(category: str) -> tuple[int, int]:
@@ -98,7 +115,10 @@ def _infer_meal_window(category: str) -> tuple[int | None, int | None]:
 
 def _infer_indoor(primary_type: str | None) -> bool:
     if not primary_type:
-        return True
+        raise RequestContractError(
+            "PLACE_PRIMARY_TYPE_MISSING",
+            "Google Place primaryType is required to infer indoor/outdoor classification.",
+        )
     lowered = primary_type.lower()
     outdoor_keywords = {"park", "pier", "beach", "trail", "campground"}
     return not any(keyword in lowered for keyword in outdoor_keywords)
@@ -122,10 +142,24 @@ def _map_price_level(price_level: str | None) -> str | None:
 
 
 def _infer_utility(place: dict) -> int:
-    rating = float(place.get("rating") or 0.0)
-    user_rating_count = int(place.get("userRatingCount") or 0)
+    if not isinstance(place.get("rating"), (int, float)):
+        raise RequestContractError(
+            "PLACE_RATING_MISSING",
+            "Google Place rating is required for import.",
+        )
+    if not isinstance(place.get("userRatingCount"), int):
+        raise RequestContractError(
+            "PLACE_RATING_COUNT_MISSING",
+            "Google Place userRatingCount is required for import.",
+        )
+    rating = float(place["rating"])
+    user_rating_count = int(place["userRatingCount"])
     if rating <= 0:
-        return 10
+        raise RequestContractError(
+            "PLACE_RATING_INVALID",
+            "Google Place rating must be greater than zero.",
+            details={"rating": rating},
+        )
     social_boost = min(user_rating_count // 200, 4)
     return max(8, int(round(rating * 3)) + social_boost)
 
@@ -163,6 +197,11 @@ def _sync_opening_rules(db: Session, poi: PoiMaster, place: dict) -> None:
     db.query(PoiOpeningRule).filter(PoiOpeningRule.poi_id == poi.id).delete()
     opening_hours = place.get("regularOpeningHours") or {}
     periods = opening_hours.get("periods") or []
+    if not periods:
+        raise RequestContractError(
+            "PLACE_OPENING_HOURS_MISSING",
+            "Google Place regularOpeningHours.periods is required for import.",
+        )
     for period in periods:
         open_info = period.get("open") or {}
         close_info = period.get("close") or {}
@@ -189,19 +228,6 @@ def _sync_opening_rules(db: Session, poi: PoiMaster, place: dict) -> None:
                 valid_from=None,
                 valid_to=None,
                 holiday_note=None,
-                last_admission_minute=None,
-            )
-        )
-    if not periods:
-        db.add(
-            PoiOpeningRule(
-                poi_id=poi.id,
-                weekday=None,
-                open_minute=9 * 60,
-                close_minute=18 * 60,
-                valid_from=None,
-                valid_to=None,
-                holiday_note="Imported default window",
                 last_admission_minute=None,
             )
         )
@@ -242,7 +268,7 @@ def patch_poi(
     return _serialize_poi_detail(poi)
 
 
-@router.post("/search")
+@router.post("/search", response_model=PoiSearchResponseOut)
 async def search_pois(body: PoiSearchBody) -> dict:
     results = await search_places_text(body.query, body.region)
     return {"results": results}
@@ -258,11 +284,13 @@ async def import_poi(body: PoiImportBody, db: Session = Depends(get_db)) -> PoiD
     if lat is None or lng is None:
         raise HTTPException(status_code=400, detail="Place details missing location")
 
-    display_name = (
-        body.display_name
-        or (place.get("displayName") or {}).get("text")
-        or f"Imported {place_id}"
-    )
+    display_name = body.display_name or (place.get("displayName") or {}).get("text")
+    if not isinstance(display_name, str) or not display_name.strip():
+        raise RequestContractError(
+            "PLACE_DISPLAY_NAME_MISSING",
+            "Google Place displayName.text is required for import.",
+            details={"place_id": place_id},
+        )
     primary_type = place.get("primaryType")
     if _is_generic_dining_type(primary_type) and body.category_override is None:
         raise HTTPException(

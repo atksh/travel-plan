@@ -1,36 +1,29 @@
 "use client";
 
 import { useParams } from "next/navigation";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import {
   appleMapsHref,
   formatMinute,
   googleMapsHref,
   humanizeReason,
 } from "@/lib/format";
-import {
-  deriveActiveTripState,
-  loadActiveTripBootstrap,
-  resolveDisplayedCurrentStop,
-} from "@/lib/active-trip";
+import { loadActiveTripBootstrap } from "@/lib/active-trip";
 import { api } from "@/lib/api";
 import { useOnlineStatus } from "@/lib/offline-cache";
 import { requiresDiningCategoryChoice } from "@/lib/poi-import";
 import { stopToPoint } from "@/lib/stops";
 import type {
-  EventOut,
-  PlannedStopOut,
+  ActiveTripBootstrapOut,
   PoiSummary,
-  RoutePreviewOut,
   SolveResponse,
-  TripDetailOut,
 } from "@/lib/types";
 
 type SearchResult = {
   place_id: string;
-  displayName?: { text?: string };
-  primaryType?: string;
-  location?: { latitude?: number; longitude?: number };
+  displayName: { text: string };
+  primaryType: string;
+  location: { latitude: number; longitude: number };
 };
 
 function MapButtons({
@@ -71,83 +64,49 @@ function MapButtons({
 export default function ActiveTripPage() {
   const params = useParams();
   const tripId = String(params.id);
-  const [trip, setTrip] = useState<TripDetailOut | null>(null);
-  const [preview, setPreview] = useState<RoutePreviewOut>({ stops: [] });
-  const [events, setEvents] = useState<EventOut[]>([]);
-  const [pois, setPois] = useState<PoiSummary[]>([]);
+  const [bootstrap, setBootstrap] = useState<ActiveTripBootstrapOut | null>(null);
   const [searchTerm, setSearchTerm] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
-  const [bootstrapWarning, setBootstrapWarning] = useState<string | null>(null);
   const [lastReplan, setLastReplan] = useState<SolveResponse | null>(null);
-  const [currentStopFallback, setCurrentStopFallback] =
-    useState<PlannedStopOut | null>(null);
   const isOnline = useOnlineStatus();
-  const poisRef = useRef<PoiSummary[]>([]);
-
-  useEffect(() => {
-    poisRef.current = pois;
-  }, [pois]);
 
   const refresh = useCallback(async () => {
     try {
-      const bootstrap = await loadActiveTripBootstrap(
-        {
-          loadTrip: () => api<TripDetailOut>(`/api/trips/${tripId}`),
-          loadPreview: () => api<RoutePreviewOut>(`/api/trips/${tripId}/route-preview`),
-          loadEvents: () => api<EventOut[]>(`/api/trips/${tripId}/events`),
-          loadPois: () => api<PoiSummary[]>("/api/pois"),
-        },
-        poisRef.current,
+      const nextBootstrap = await loadActiveTripBootstrap(() =>
+        api<ActiveTripBootstrapOut>(`/api/trips/${tripId}/active-bootstrap`),
       );
-      setTrip(bootstrap.trip);
-      setPreview(bootstrap.preview);
-      setEvents(bootstrap.events);
-      setPois(bootstrap.pois);
-      setBootstrapWarning(bootstrap.warning);
+      setBootstrap(nextBootstrap);
       setError(null);
     } catch (refreshError) {
-      setBootstrapWarning(null);
       setError(refreshError instanceof Error ? refreshError.message : "Refresh failed");
       throw refreshError;
     }
   }, [tripId]);
 
   useEffect(() => {
-    void refresh().catch(() => undefined);
+    void refresh().catch((refreshError) => {
+      setError(refreshError instanceof Error ? refreshError.message : "Refresh failed");
+    });
   }, [refresh]);
 
-  const poiById = useMemo(() => new Map(pois.map((poi) => [poi.id, poi])), [pois]);
-  const activeState = useMemo(
-    () => deriveActiveTripState(preview.stops, events),
-    [events, preview.stops],
-  );
-  const displayedCurrentStop = useMemo(
-    () => resolveDisplayedCurrentStop(activeState, currentStopFallback),
-    [activeState, currentStopFallback],
-  );
-
-  useEffect(() => {
-    if (activeState.inProgressPoiId === null) {
-      setCurrentStopFallback(null);
-      return;
-    }
-    if (activeState.currentStop !== null) {
-      setCurrentStopFallback(activeState.currentStop);
-    }
-  }, [activeState.currentStop, activeState.inProgressPoiId]);
-
-  const currentPoint =
-    trip && displayedCurrentStop
-      ? stopToPoint(displayedCurrentStop, trip, poiById)
-      : null;
-  const nextPoint =
-    trip && activeState.nextStop ? stopToPoint(activeState.nextStop, trip, poiById) : null;
+  const trip = bootstrap?.trip ?? null;
+  const pois = bootstrap?.pois ?? [];
+  const activeState = bootstrap?.active_state ?? {
+    completed_poi_ids: [],
+    in_progress_poi_id: null,
+    current_stop: null,
+    next_stop: null,
+  };
+  const currentPoint = activeState.current_stop
+    ? stopToPoint(activeState.current_stop)
+    : null;
+  const nextPoint = activeState.next_stop ? stopToPoint(activeState.next_stop) : null;
   const removableCandidates =
     trip?.candidates.filter(
-      (candidate) => !activeState.completedPoiIds.includes(candidate.poi_id),
+      (candidate) => !activeState.completed_poi_ids.includes(candidate.poi_id),
     ) ?? [];
   const localMatches = searchTerm
     ? pois.filter((poi) => poi.name.toLowerCase().includes(searchTerm.toLowerCase())).slice(0, 5)
@@ -155,16 +114,16 @@ export default function ActiveTripPage() {
 
   async function requestCurrentLocation(): Promise<Record<string, number>> {
     if (!navigator.geolocation) {
-      return {};
+      throw new Error("Geolocation is not available in this browser.");
     }
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       navigator.geolocation.getCurrentPosition(
         (position) =>
           resolve({
             current_lat: position.coords.latitude,
             current_lng: position.coords.longitude,
           }),
-        () => resolve({}),
+        () => reject(new Error("Unable to retrieve current location.")),
         { enableHighAccuracy: true, timeout: 10000 },
       );
     });
@@ -173,9 +132,10 @@ export default function ActiveTripPage() {
   async function postLifecycleEvent(eventType: "arrived" | "departed" | "skipped") {
     const targetPoiId =
       eventType === "departed"
-        ? activeState.inProgressPoiId
-        : displayedCurrentStop?.poi_id;
+        ? activeState.in_progress_poi_id
+        : activeState.current_stop?.poi_id;
     if (!targetPoiId) {
+      setError("No target stop is available for this action.");
       return;
     }
     setBusy(eventType);
@@ -204,7 +164,6 @@ export default function ActiveTripPage() {
         body: JSON.stringify(locationBody),
       });
       setLastReplan(response);
-      setPreview({ stops: response.planned_stops });
       await refresh();
       setNote(
         response.alternatives.length > 0
@@ -299,7 +258,7 @@ export default function ActiveTripPage() {
         method: "POST",
         body: JSON.stringify({
           place_id: result.place_id,
-          display_name: result.displayName?.text,
+          display_name: result.displayName.text,
           category_override: categoryOverride ?? null,
         }),
       });
@@ -342,7 +301,7 @@ export default function ActiveTripPage() {
             </div>
             <div className="summary-pill">
               <span>Completed</span>
-              <strong>{activeState.completedPoiIds.length}</strong>
+              <strong>{activeState.completed_poi_ids.length}</strong>
             </div>
             {!isOnline ? <div className="offline-badge">Offline actions disabled</div> : null}
           </div>
@@ -350,7 +309,6 @@ export default function ActiveTripPage() {
 
         {error ? <p className="error-text">{error}</p> : null}
         {note ? <p className="muted-text">{note}</p> : null}
-        {bootstrapWarning ? <p className="muted-text">{bootstrapWarning}</p> : null}
 
         <div className="two-column">
           <section className="panel">
@@ -361,21 +319,21 @@ export default function ActiveTripPage() {
             <div className="stack">
               <article className="candidate-item">
                 <div className="candidate-title">
-                  {displayedCurrentStop?.poi_name || "No current stop"}
+                  {activeState.current_stop?.poi_name || "No current stop"}
                 </div>
                 <div className="timeline-meta">
-                  {displayedCurrentStop
-                    ? `${formatMinute(displayedCurrentStop.arrival_min)} - ${formatMinute(displayedCurrentStop.departure_min)}`
+                  {activeState.current_stop
+                    ? `${formatMinute(activeState.current_stop.arrival_min)} - ${formatMinute(activeState.current_stop.departure_min)}`
                     : "The route may still be empty."}
                 </div>
               </article>
               <article className="candidate-item">
                 <div className="candidate-title">
-                  {activeState.nextStop?.poi_name || "No next stop"}
+                  {activeState.next_stop?.poi_name || "No next stop"}
                 </div>
                 <div className="timeline-meta">
-                  {activeState.nextStop
-                    ? `Next ETA ${formatMinute(activeState.nextStop.arrival_min)}`
+                  {activeState.next_stop
+                    ? `Next ETA ${formatMinute(activeState.next_stop.arrival_min)}`
                     : "Nothing queued after the current stop."}
                 </div>
               </article>
@@ -386,8 +344,8 @@ export default function ActiveTripPage() {
                 disabled={
                   !isOnline ||
                   busy !== null ||
-                  displayedCurrentStop === null ||
-                  activeState.inProgressPoiId !== null
+                  activeState.current_stop === null ||
+                  activeState.in_progress_poi_id !== null
                 }
                 type="button"
                 onClick={() => void postLifecycleEvent("arrived")}
@@ -396,7 +354,7 @@ export default function ActiveTripPage() {
               </button>
               <button
                 className="secondary-button"
-                disabled={!isOnline || busy !== null || activeState.inProgressPoiId === null}
+                disabled={!isOnline || busy !== null || activeState.in_progress_poi_id === null}
                 type="button"
                 onClick={() => void postLifecycleEvent("departed")}
               >
@@ -404,7 +362,7 @@ export default function ActiveTripPage() {
               </button>
               <button
                 className="secondary-button"
-                disabled={!isOnline || busy !== null || displayedCurrentStop === null}
+                disabled={!isOnline || busy !== null || activeState.current_stop === null}
                 type="button"
                 onClick={() => void postLifecycleEvent("skipped")}
               >
@@ -471,7 +429,7 @@ export default function ActiveTripPage() {
                 return (
                   <article key={result.place_id} className="candidate-item">
                     <div className="candidate-title">
-                      {result.displayName?.text || result.place_id}
+                      {result.displayName.text}
                     </div>
                     <div className="timeline-meta">
                       {needsChoice

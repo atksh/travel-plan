@@ -1,4 +1,27 @@
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:8000";
+import { API_BASE } from "@/lib/runtime-config";
+
+function readApiErrorMessage(payload: unknown, fallback: string): string {
+  if (
+    payload &&
+    typeof payload === "object" &&
+    "error" in payload &&
+    payload.error &&
+    typeof payload.error === "object" &&
+    "message" in payload.error &&
+    typeof payload.error.message === "string"
+  ) {
+    return payload.error.message;
+  }
+  if (
+    payload &&
+    typeof payload === "object" &&
+    "detail" in payload &&
+    typeof payload.detail === "string"
+  ) {
+    return payload.detail;
+  }
+  return fallback;
+}
 
 export async function api<T>(
   path: string,
@@ -12,8 +35,16 @@ export async function api<T>(
     },
   });
   if (!r.ok) {
-    const t = await r.text();
-    throw new Error(t || r.statusText);
+    const text = await r.text();
+    let payload: unknown = null;
+    if (text) {
+      try {
+        payload = JSON.parse(text);
+      } catch {
+        payload = null;
+      }
+    }
+    throw new Error(readApiErrorMessage(payload, text || r.statusText));
   }
   return r.json() as Promise<T>;
 }

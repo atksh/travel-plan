@@ -1,4 +1,4 @@
-"""Core trip solver using OR-Tools MIP with a heuristic fallback."""
+"""Core trip solver using OR-Tools MIP with strict contracts."""
 
 from __future__ import annotations
 
@@ -10,12 +10,11 @@ from datetime import date
 from ortools.linear_solver import pywraplp
 from sqlalchemy.orm import Session
 
+from app.errors import StateContractError
 from app.models.poi import PoiDependencyRule, PoiMaster
-from app.services.geo import estimate_drive_minutes
 
 START_NODE = -1
 END_NODE = -2
-MAX_HEURISTIC_NODES = 12
 STOP_PENALTY = 1.0
 LATE_MEAL_PENALTY = 0.08
 WAIT_RISK_PENALTY = 0.1
@@ -104,7 +103,7 @@ def _select_opening_window(
     poi: PoiMaster, plan_date: date | None
 ) -> tuple[int, int, int | None] | None:
     if not poi.opening_rules:
-        return 0, 24 * 60, None
+        return None
 
     generic_rule = next(
         (rule for rule in poi.opening_rules if rule.weekday is None),
@@ -399,6 +398,7 @@ def _prepare_solver_data(session: Session, inp: SolverInput) -> PreparedSolverDa
             continue
         opening_window = _select_opening_window(poi, inp.plan_date)
         if opening_window is None:
+            reasons.append(f"missing_opening_window_{poi_id}")
             continue
         poi_ids.append(poi_id)
         coords[poi_id] = (poi.lat, poi.lng)
@@ -441,25 +441,24 @@ def _prepare_solver_data(session: Session, inp: SolverInput) -> PreparedSolverDa
 
     all_node_ids = [START_NODE] + poi_ids + [END_NODE]
     travel: dict[tuple[int, int], int] = {}
-    matrix_index = {}
-    if inp.matrix_node_ids is not None and inp.travel_matrix is not None:
-        matrix_index = {node_id: idx for idx, node_id in enumerate(inp.matrix_node_ids)}
+    if inp.matrix_node_ids is None or inp.travel_matrix is None:
+        raise StateContractError(
+            "SOLVER_TRAVEL_MATRIX_MISSING",
+            "SolverInput requires a complete travel matrix and matrix node IDs.",
+        )
+    matrix_index = {node_id: idx for idx, node_id in enumerate(inp.matrix_node_ids)}
 
     for i in all_node_ids:
         for j in all_node_ids:
             if i == j:
                 continue
-            if i in matrix_index and j in matrix_index and inp.travel_matrix is not None:
-                travel[(i, j)] = int(inp.travel_matrix[matrix_index[i]][matrix_index[j]])
-                continue
-            start_coord = coords[i]
-            end_coord = coords[j]
-            travel[(i, j)] = estimate_drive_minutes(
-                start_coord[0],
-                start_coord[1],
-                end_coord[0],
-                end_coord[1],
-            )
+            if i not in matrix_index or j not in matrix_index:
+                raise StateContractError(
+                    "SOLVER_TRAVEL_MATRIX_INCOMPLETE",
+                    "SolverInput matrix_node_ids did not cover all route nodes.",
+                    details={"from_node": i, "to_node": j},
+                )
+            travel[(i, j)] = int(inp.travel_matrix[matrix_index[i]][matrix_index[j]])
 
     return PreparedSolverData(
         poi_ids=poi_ids,
@@ -901,25 +900,17 @@ def solve_trip(session: Session, inp: SolverInput) -> SolverResult:
         result.solve_ms = int((time.perf_counter() - started) * 1000)
         return result
 
-    if len(data.poi_ids) > MAX_HEURISTIC_NODES:
-        result = _solve_with_heuristic(inp, data)
-        if result.feasible:
-            result = _normalize_departure_window(inp, data, result)
-        result.solve_ms = int((time.perf_counter() - started) * 1000)
-        return result
-
     status, result = _solve_with_mip(inp, data)
     if status in (pywraplp.Solver.OPTIMAL, pywraplp.Solver.FEASIBLE):
         result = _normalize_departure_window(inp, data, result)
         result.solve_ms = int((time.perf_counter() - started) * 1000)
         return result
+
     if status in (pywraplp.Solver.NOT_SOLVED, pywraplp.Solver.ABNORMAL):
-        fallback = _solve_with_heuristic(inp, data)
-        fallback.reason_codes = _dedupe_codes(result.reason_codes, fallback.reason_codes)
-        if fallback.feasible:
-            fallback = _normalize_departure_window(inp, data, fallback)
-        fallback.solve_ms = int((time.perf_counter() - started) * 1000)
-        return fallback
+        result.reason_codes = _dedupe_codes(
+            result.reason_codes,
+            ["mip_not_solved"],
+        )
 
     result.solve_ms = int((time.perf_counter() - started) * 1000)
     return result

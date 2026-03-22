@@ -3,6 +3,8 @@ from typing import Any
 
 from pydantic import BaseModel, Field, model_validator
 
+from app.schemas.poi import PoiOut
+
 
 class TripPreferencePatch(BaseModel):
     driving_penalty_weight: float | None = None
@@ -139,41 +141,70 @@ class SolverRunOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class RouteLegOut(BaseModel):
+    from_sequence_order: int
+    to_sequence_order: int
+    duration_minutes: int
+    distance_meters: int | None = None
+    encoded_polyline: str
+
+
 class PlannedStopOut(BaseModel):
     id: int | None = None
     sequence_order: int
     poi_id: int | None
-    poi_name: str | None = None
-    label: str | None = None
+    poi_name: str
+    label: str
     node_kind: str
-    lat: float | None = None
-    lng: float | None = None
-    arrival_min: int | None
-    departure_min: int | None
-    stay_min: int | None
+    lat: float
+    lng: float
+    arrival_min: int
+    departure_min: int
+    stay_min: int
     leg_from_prev_min: int | None
+    leg_polyline: str | None = None
     status: str
 
     model_config = {"from_attributes": True}
 
 
-class TripDetailOut(TripOut):
-    preference_profile: TripPreferenceOut | None = None
-    candidates: list[CandidateOut] = []
-    latest_route: list[PlannedStopOut] = []
-    latest_solver_run: SolverRunOut | None = None
-
-
-class SolveResponse(BaseModel):
+class SolveSnapshotOut(BaseModel):
     feasible: bool
     objective: float | None
-    ordered_poi_ids: list[int]
-    reason_codes: list[str]
+    ordered_poi_ids: list[int] = Field(default_factory=list)
+    reason_codes: list[str] = Field(default_factory=list)
     solve_ms: int
-    planned_stops: list[PlannedStopOut] = []
     solver_run_id: int | None = None
-    alternatives: list[CandidateOut] = []
+    used_bucket: str
+    used_traffic_matrix: bool
+    shortlist_ids: list[int] = Field(default_factory=list)
+    planned_stops: list[PlannedStopOut] = Field(default_factory=list)
+    route_legs: list[RouteLegOut] = Field(default_factory=list)
+
+
+class TripDetailOut(TripOut):
+    preference_profile: TripPreferenceOut | None = None
+    candidates: list[CandidateOut] = Field(default_factory=list)
+    latest_solve: SolveSnapshotOut | None = None
+
+
+class SolveResponse(SolveSnapshotOut):
+    alternatives: list[CandidateOut] = Field(default_factory=list)
 
 
 class RoutePreviewOut(BaseModel):
-    stops: list[PlannedStopOut]
+    solve: SolveSnapshotOut | None = None
+
+
+class ActiveTripStateOut(BaseModel):
+    completed_poi_ids: list[int] = Field(default_factory=list)
+    in_progress_poi_id: int | None = None
+    current_stop: PlannedStopOut | None = None
+    next_stop: PlannedStopOut | None = None
+
+
+class ActiveTripBootstrapOut(BaseModel):
+    trip: TripDetailOut
+    events: list[EventOut] = Field(default_factory=list)
+    pois: list[PoiOut] = Field(default_factory=list)
+    active_state: ActiveTripStateOut

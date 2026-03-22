@@ -46,8 +46,28 @@ class PoiOut(BaseModel):
 
 class PoiDetailOut(PoiOut):
     planning_profile: PoiPlanningProfileOut | None = None
-    opening_rules: list[PoiOpeningRuleOut] = []
-    tags: list[str] = []
+    opening_rules: list[PoiOpeningRuleOut] = Field(default_factory=list)
+    tags: list[str] = Field(default_factory=list)
+
+
+class PoiSearchDisplayNameOut(BaseModel):
+    text: str
+
+
+class PoiSearchLocationOut(BaseModel):
+    latitude: float
+    longitude: float
+
+
+class PoiSearchResultOut(BaseModel):
+    place_id: str
+    displayName: PoiSearchDisplayNameOut
+    location: PoiSearchLocationOut
+    primaryType: str
+
+
+class PoiSearchResponseOut(BaseModel):
+    results: list[PoiSearchResultOut] = Field(default_factory=list)
 
 
 class PoiSearchBody(BaseModel):

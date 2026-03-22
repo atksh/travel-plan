@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
 
-from app.services.google_places import compute_route_polyline
+from app.services.google_places import RouteLegDetails, compute_route_polyline
 
 
 @dataclass
@@ -18,9 +17,9 @@ class LegRefinement:
     routing_preference: str = "TRAFFIC_AWARE"
 
 
-async def refine_legs(legs: list[LegRefinement]) -> list[dict[str, Any]]:
+async def refine_legs(legs: list[LegRefinement]) -> list[RouteLegDetails]:
     """Call computeRoutes per leg (parallel in production)."""
-    out: list[dict[str, Any]] = []
+    out: list[RouteLegDetails] = []
     for leg in legs:
         r = await compute_route_polyline(
             (leg.from_lat, leg.from_lng),

@@ -1,26 +1,78 @@
-"""Google Places (New) and Routes API clients. Uses mock data when API key is absent."""
+"""Google Places (New) and Routes API clients."""
 
 from __future__ import annotations
 
-import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
 
 from app.config import settings
+from app.errors import DependencyError, RequestContractError
+
+
+@dataclass(slots=True)
+class RouteLegDetails:
+    duration_minutes: int
+    polyline: str
+    distance_meters: int | None
+
+
+def _assert_api_key_configured() -> None:
+    if not settings.google_maps_api_key.strip():
+        raise DependencyError(
+            "GOOGLE_MAPS_API_KEY_MISSING",
+            "Google Maps API key is required for this operation.",
+            status_code=500,
+        )
+
+
+def _require_future_departure_time_iso(departure_time_iso: str | None) -> str:
+    if departure_time_iso is None:
+        raise RequestContractError(
+            "DEPARTURE_TIME_REQUIRED",
+            "A future departure_time_iso is required for traffic-aware routing.",
+        )
+    try:
+        departure_time = datetime.fromisoformat(departure_time_iso.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RequestContractError(
+            "DEPARTURE_TIME_INVALID",
+            "departure_time_iso must be a valid RFC3339 timestamp.",
+            details={"departure_time_iso": departure_time_iso},
+        ) from exc
+    if departure_time.tzinfo is None:
+        raise RequestContractError(
+            "DEPARTURE_TIME_INVALID",
+            "departure_time_iso must include timezone information.",
+            details={"departure_time_iso": departure_time_iso},
+        )
+    now = datetime.now(timezone.utc)
+    if departure_time.astimezone(timezone.utc) <= now:
+        raise RequestContractError(
+            "DEPARTURE_TIME_IN_PAST",
+            "departure_time_iso must be in the future.",
+            details={"departure_time_iso": departure_time_iso},
+        )
+    return departure_time_iso
+
+
+def _parse_duration_seconds(duration: Any, *, field_name: str) -> int:
+    if isinstance(duration, str) and duration.endswith("s") and duration[:-1].isdigit():
+        return int(duration[:-1])
+    if isinstance(duration, dict) and isinstance(duration.get("seconds"), (int, float)):
+        return int(duration["seconds"])
+    raise DependencyError(
+        "GOOGLE_RESPONSE_INVALID",
+        f"Google response field '{field_name}' had an invalid duration shape.",
+        details={"field_name": field_name, "duration": duration},
+    )
 
 
 async def search_places_text(query: str, region: str = "jp") -> list[dict[str, Any]]:
     """Places API (New) text search — returns simplified dicts."""
-    if not settings.google_maps_api_key:
-        return [
-            {
-                "place_id": "mock_place",
-                "displayName": {"text": f"Mock result for {query}"},
-                "location": {"latitude": 35.1, "longitude": 140.1},
-                "primaryType": "restaurant",
-            }
-        ]
+    _assert_api_key_configured()
     url = "https://places.googleapis.com/v1/places:searchText"
     headers = {
         "Content-Type": "application/json",
@@ -34,12 +86,46 @@ async def search_places_text(query: str, region: str = "jp") -> list[dict[str, A
         data = r.json()
     out: list[dict[str, Any]] = []
     for p in data.get("places", []):
+        place_id = p.get("id")
+        display_name = p.get("displayName")
+        location = p.get("location")
+        primary_type = p.get("primaryType")
+        if not isinstance(place_id, str):
+            raise DependencyError(
+                "GOOGLE_RESPONSE_INVALID",
+                "Places search returned a place without a valid id.",
+            )
+        if not (
+            isinstance(display_name, dict)
+            and isinstance(display_name.get("text"), str)
+        ):
+            raise DependencyError(
+                "GOOGLE_RESPONSE_INVALID",
+                "Places search returned a place without displayName.text.",
+                details={"place_id": place_id},
+            )
+        if not (
+            isinstance(location, dict)
+            and isinstance(location.get("latitude"), (int, float))
+            and isinstance(location.get("longitude"), (int, float))
+        ):
+            raise DependencyError(
+                "GOOGLE_RESPONSE_INVALID",
+                "Places search returned a place without valid location.",
+                details={"place_id": place_id},
+            )
+        if not isinstance(primary_type, str):
+            raise DependencyError(
+                "GOOGLE_RESPONSE_INVALID",
+                "Places search returned a place without primaryType.",
+                details={"place_id": place_id},
+            )
         out.append(
             {
-                "place_id": p.get("id"),
-                "displayName": p.get("displayName"),
-                "location": p.get("location"),
-                "primaryType": p.get("primaryType"),
+                "place_id": place_id,
+                "displayName": display_name,
+                "location": location,
+                "primaryType": primary_type,
             }
         )
     return out
@@ -53,27 +139,7 @@ async def get_place_details(
 ) -> dict[str, Any]:
     """Place Details (New) using the official GET /v1/places/{placeId} endpoint."""
     normalized_place_id = place_id.removeprefix("places/")
-    if not settings.google_maps_api_key:
-        return {
-            "id": normalized_place_id,
-            "name": f"places/{normalized_place_id}",
-            "displayName": {"text": f"Imported {normalized_place_id}"},
-            "location": {"latitude": 35.1, "longitude": 140.1},
-            "regularOpeningHours": {
-                "periods": [
-                    {
-                        "open": {"day": 1, "hour": 10, "minute": 0},
-                        "close": {"day": 1, "hour": 18, "minute": 0},
-                    }
-                ]
-            },
-            "businessStatus": "OPERATIONAL",
-            "rating": 4.2,
-            "userRatingCount": 120,
-            "priceLevel": "PRICE_LEVEL_MODERATE",
-            "primaryType": "restaurant",
-            "websiteUri": None,
-        }
+    _assert_api_key_configured()
 
     url = f"https://places.googleapis.com/v1/places/{normalized_place_id}"
     headers = {
@@ -115,14 +181,11 @@ async def compute_route_matrix_minutes(
 ) -> list[list[int]]:
     """
     Routes API computeRouteMatrix — returns duration minutes matrix.
-    Single departure time per request (API constraint). Mock if no key.
+    Single departure time per request (API constraint).
     """
     n_o = len(origins)
     n_d = len(destinations)
-    if not settings.google_maps_api_key:
-        time.sleep(0.01)
-        # Simple mock: 30 min per cell
-        return [[30 + i + j for j in range(n_d)] for i in range(n_o)]
+    _assert_api_key_configured()
 
     # Routes API v2 computeRouteMatrix
     url = "https://routes.googleapis.com/distanceMatrix/v2:computeRouteMatrix"
@@ -131,8 +194,9 @@ async def compute_route_matrix_minutes(
         "X-Goog-Api-Key": settings.google_maps_api_key,
         "X-Goog-FieldMask": "originIndex,destinationIndex,duration,distanceMeters",
     }
-    # One departure time for all origins (per Google API contract)
-    dep = departure_time_iso or "2026-03-21T09:00:00+09:00"
+    effective_routing_preference = routing_preference or (
+        "TRAFFIC_AWARE" if traffic_aware else "TRAFFIC_UNAWARE"
+    )
     body: dict[str, Any] = {
         "origins": [
             {"waypoint": {"location": {"latLng": {"latitude": la, "longitude": ln}}}}
@@ -143,30 +207,43 @@ async def compute_route_matrix_minutes(
             for la, ln in destinations
         ],
         "travelMode": "DRIVE",
-        "routingPreference": routing_preference
-        or ("TRAFFIC_AWARE" if traffic_aware else "TRAFFIC_UNAWARE"),
-        "departureTime": dep,
+        "routingPreference": effective_routing_preference,
     }
+    if effective_routing_preference != "TRAFFIC_UNAWARE":
+        body["departureTime"] = _require_future_departure_time_iso(departure_time_iso)
     async with httpx.AsyncClient(timeout=60.0) as client:
-        t0 = time.perf_counter()
         r = await client.post(url, headers=headers, json=body)
         r.raise_for_status()
-        latency_ms = int((time.perf_counter() - t0) * 1000)
         rows = r.json()
     # Response is stream of RouteMatrixElement
+    if not isinstance(rows, list):
+        raise DependencyError(
+            "GOOGLE_RESPONSE_INVALID",
+            "computeRouteMatrix returned an invalid payload shape.",
+        )
     matrix = [[0] * n_d for _ in range(n_o)]
-    if isinstance(rows, list):
-        for el in rows:
-            oi = el.get("originIndex", 0)
-            di = el.get("destinationIndex", 0)
-            dur = el.get("duration", "0s")
-            if isinstance(dur, str) and dur.endswith("s"):
-                sec = int(dur[:-1])
-            elif isinstance(dur, dict) and "seconds" in dur:
-                sec = int(dur["seconds"])
-            else:
-                sec = int(dur) if isinstance(dur, (int, float)) else 0
-            matrix[oi][di] = max(1, sec // 60)
+    for el in rows:
+        if not isinstance(el, dict):
+            raise DependencyError(
+                "GOOGLE_RESPONSE_INVALID",
+                "computeRouteMatrix returned a non-object element.",
+            )
+        origin_index = el.get("originIndex")
+        destination_index = el.get("destinationIndex")
+        if not isinstance(origin_index, int) or not isinstance(destination_index, int):
+            raise DependencyError(
+                "GOOGLE_RESPONSE_INVALID",
+                "computeRouteMatrix element is missing originIndex or destinationIndex.",
+                details={"element": el},
+            )
+        if not (0 <= origin_index < n_o and 0 <= destination_index < n_d):
+            raise DependencyError(
+                "GOOGLE_RESPONSE_INVALID",
+                "computeRouteMatrix returned out-of-range indices.",
+                details={"element": el},
+            )
+        seconds = _parse_duration_seconds(el.get("duration"), field_name="duration")
+        matrix[origin_index][destination_index] = max(1, seconds // 60)
     return matrix
 
 
@@ -175,14 +252,9 @@ async def compute_route_polyline(
     destination: tuple[float, float],
     departure_time_iso: str | None = None,
     routing_preference: str = "TRAFFIC_AWARE",
-) -> dict[str, Any]:
+) -> RouteLegDetails:
     """computeRoutes for one leg — polyline + duration."""
-    if not settings.google_maps_api_key:
-        return {
-            "duration_minutes": 35,
-            "polyline": None,
-            "mock": True,
-        }
+    _assert_api_key_configured()
     url = "https://routes.googleapis.com/directions/v2:computeRoutes"
     headers = {
         "Content-Type": "application/json",
@@ -196,23 +268,46 @@ async def compute_route_polyline(
         },
         "travelMode": "DRIVE",
         "routingPreference": routing_preference,
-        "departureTime": departure_time_iso or "2026-03-21T12:00:00+09:00",
     }
+    if routing_preference != "TRAFFIC_UNAWARE":
+        body["departureTime"] = _require_future_departure_time_iso(departure_time_iso)
     async with httpx.AsyncClient(timeout=60.0) as client:
         r = await client.post(url, headers=headers, json=body)
         r.raise_for_status()
         data = r.json()
     routes = data.get("routes", [])
     if not routes:
-        return {"duration_minutes": 0, "polyline": None}
+        raise DependencyError(
+            "GOOGLE_RESPONSE_INVALID",
+            "computeRoutes returned no routes.",
+            details={"origin": origin, "destination": destination},
+        )
     route0 = routes[0]
-    dur = route0.get("duration", "0s")
-    if isinstance(dur, str) and dur.endswith("s"):
-        minutes = max(1, int(dur[:-1]) // 60)
-    else:
-        minutes = 30
-    return {
-        "duration_minutes": minutes,
-        "polyline": route0.get("polyline"),
-        "distance_meters": route0.get("distanceMeters"),
-    }
+    if not isinstance(route0, dict):
+        raise DependencyError(
+            "GOOGLE_RESPONSE_INVALID",
+            "computeRoutes returned an invalid route payload.",
+        )
+    dur = route0.get("duration")
+    polyline = route0.get("polyline")
+    if not isinstance(polyline, dict) or not isinstance(
+        polyline.get("encodedPolyline"), str
+    ):
+        raise DependencyError(
+            "GOOGLE_RESPONSE_INVALID",
+            "computeRoutes returned a route without encoded polyline.",
+            details={"route": route0},
+        )
+    seconds = _parse_duration_seconds(dur, field_name="duration")
+    distance_meters = route0.get("distanceMeters")
+    if distance_meters is not None and not isinstance(distance_meters, int):
+        raise DependencyError(
+            "GOOGLE_RESPONSE_INVALID",
+            "computeRoutes returned a non-integer distanceMeters.",
+            details={"route": route0},
+        )
+    return RouteLegDetails(
+        duration_minutes=max(1, seconds // 60),
+        polyline=polyline["encodedPolyline"],
+        distance_meters=distance_meters,
+    )

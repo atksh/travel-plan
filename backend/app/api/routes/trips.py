@@ -22,17 +22,23 @@ from app.models.trip import (
     TripPlan,
     TripPreferenceProfile,
 )
+from app.errors import StateContractError
+from app.schemas.poi import PoiOut
 from app.schemas.trip import (
+    ActiveTripBootstrapOut,
+    ActiveTripStateOut,
     CandidateCreate,
     CandidateOut,
     CandidatePatch,
     EventCreate,
     EventOut,
     PlannedStopOut,
+    RouteLegOut,
     ReplanRequest,
     RoutePreviewOut,
     SolveRequest,
     SolveResponse,
+    SolveSnapshotOut,
     SolverRunOut,
     TripCreate,
     TripDetailOut,
@@ -104,11 +110,17 @@ def _serialize_preference(
 
 def _serialize_candidate(candidate: TripCandidate) -> CandidateOut:
     poi = candidate.poi
+    if poi is None:
+        raise StateContractError(
+            "TRIP_CANDIDATE_POI_MISSING",
+            "Trip candidate is missing its POI relation.",
+            details={"candidate_id": candidate.id, "poi_id": candidate.poi_id},
+        )
     return CandidateOut(
         id=candidate.id,
         poi_id=candidate.poi_id,
-        poi_name=poi.name if poi is not None else f"POI {candidate.poi_id}",
-        primary_category=poi.primary_category if poi is not None else "unknown",
+        poi_name=poi.name,
+        primary_category=poi.primary_category,
         status=candidate.status,
         source=candidate.source,
         must_visit=candidate.must_visit,
@@ -121,45 +133,97 @@ def _serialize_candidate(candidate: TripCandidate) -> CandidateOut:
     )
 
 
+def _leg_polyline_for_stop(
+    sequence_order: int, route_legs: list[RouteLegOut] | None
+) -> str | None:
+    if sequence_order <= 0 or not route_legs:
+        return None
+    leg = next(
+        (candidate for candidate in route_legs if candidate.to_sequence_order == sequence_order),
+        None,
+    )
+    return None if leg is None else leg.encoded_polyline
+
+
+def _build_route_legs(
+    planned_stops: list[PlannedStopOut],
+    refined_legs: list[Any],
+) -> list[RouteLegOut]:
+    route_legs: list[RouteLegOut] = []
+    for index, refined_leg in enumerate(refined_legs, start=1):
+        if index >= len(planned_stops):
+            raise StateContractError(
+                "ROUTE_LEG_COUNT_MISMATCH",
+                "Refined route legs did not match planned stop count.",
+                details={
+                    "planned_stop_count": len(planned_stops),
+                    "refined_leg_count": len(refined_legs),
+                },
+            )
+        duration_minutes = getattr(refined_leg, "duration_minutes", None)
+        encoded_polyline = getattr(refined_leg, "polyline", None)
+        if not isinstance(duration_minutes, int) or duration_minutes <= 0:
+            raise StateContractError(
+                "ROUTE_LEG_DURATION_INVALID",
+                "Refined route leg is missing a valid duration.",
+                details={"index": index, "duration_minutes": duration_minutes},
+            )
+        if not isinstance(encoded_polyline, str) or not encoded_polyline:
+            raise StateContractError(
+                "ROUTE_LEG_POLYLINE_INVALID",
+                "Refined route leg is missing an encoded polyline.",
+                details={"index": index},
+            )
+        distance_meters = getattr(refined_leg, "distance_meters", None)
+        if distance_meters is not None and not isinstance(distance_meters, int):
+            raise StateContractError(
+                "ROUTE_LEG_DISTANCE_INVALID",
+                "Refined route leg is missing a valid distance.",
+                details={"index": index, "distance_meters": distance_meters},
+            )
+        route_legs.append(
+            RouteLegOut(
+                from_sequence_order=index - 1,
+                to_sequence_order=index,
+                duration_minutes=duration_minutes,
+                distance_meters=distance_meters,
+                encoded_polyline=encoded_polyline,
+            )
+        )
+    return route_legs
+
+
 def _serialize_planned_stop(
     stop: PlannedStop,
-    *,
-    start_label: str | None = None,
-    start_lat: float | None = None,
-    start_lng: float | None = None,
-    end_label: str | None = None,
-    end_lat: float | None = None,
-    end_lng: float | None = None,
+    leg_polyline: str | None = None,
 ) -> PlannedStopOut:
-    if stop.node_kind == "start":
-        label = stop.label or start_label
-        lat = stop.lat if stop.lat is not None else start_lat
-        lng = stop.lng if stop.lng is not None else start_lng
-    elif stop.node_kind == "end":
-        label = stop.label or end_label
-        lat = stop.lat if stop.lat is not None else end_lat
-        lng = stop.lng if stop.lng is not None else end_lng
-    else:
-        label = stop.label or (stop.poi.name if stop.poi is not None else None)
-        lat = stop.lat if stop.lat is not None else (
-            stop.poi.lat if stop.poi is not None else None
-        )
-        lng = stop.lng if stop.lng is not None else (
-            stop.poi.lng if stop.poi is not None else None
+    if (
+        stop.label is None
+        or stop.lat is None
+        or stop.lng is None
+        or stop.arrival_min is None
+        or stop.departure_min is None
+        or stop.stay_min is None
+    ):
+        raise StateContractError(
+            "PLANNED_STOP_INVALID",
+            "Persisted planned stop is missing required contract fields.",
+            details={"planned_stop_id": stop.id, "sequence_order": stop.sequence_order},
         )
     return PlannedStopOut(
         id=stop.id,
         sequence_order=stop.sequence_order,
         poi_id=stop.poi_id,
-        poi_name=label,
-        label=label,
+        poi_name=stop.label,
+        label=stop.label,
         node_kind=stop.node_kind,
-        lat=lat,
-        lng=lng,
+        lat=stop.lat,
+        lng=stop.lng,
         arrival_min=stop.arrival_min,
         departure_min=stop.departure_min,
         stay_min=stop.stay_min,
         leg_from_prev_min=stop.leg_from_prev_min,
+        leg_polyline=leg_polyline,
         status=stop.status,
     )
 
@@ -168,15 +232,16 @@ def _planned_stop(
     *,
     sequence_order: int,
     poi_id: int | None,
-    poi_name: str | None,
-    label: str | None,
+    poi_name: str,
+    label: str,
     node_kind: str,
-    lat: float | None,
-    lng: float | None,
-    arrival_min: int | None,
-    departure_min: int | None,
-    stay_min: int | None,
+    lat: float,
+    lng: float,
+    arrival_min: int,
+    departure_min: int,
+    stay_min: int,
     leg_from_prev_min: int | None,
+    leg_polyline: str | None = None,
 ) -> PlannedStopOut:
     return PlannedStopOut(
         sequence_order=sequence_order,
@@ -190,6 +255,7 @@ def _planned_stop(
         departure_min=departure_min,
         stay_min=stay_min,
         leg_from_prev_min=leg_from_prev_min,
+        leg_polyline=leg_polyline,
         status="planned",
     )
 
@@ -205,6 +271,7 @@ def _build_transient_planned_stops(
     end_label: str | None = None,
     end_lat: float | None = None,
     end_lng: float | None = None,
+    route_legs: list[RouteLegOut] | None = None,
 ) -> list[PlannedStopOut]:
     if not result.feasible:
         return []
@@ -233,6 +300,7 @@ def _build_transient_planned_stops(
             departure_min=start_departure_min,
             stay_min=0,
             leg_from_prev_min=None,
+            leg_polyline=None,
         )
     ]
 
@@ -244,7 +312,19 @@ def _build_transient_planned_stops(
             else None
         )
         poi = poi_map.get(poi_id)
-        label = poi.name if poi is not None else f"POI {poi_id}"
+        if poi is None:
+            raise StateContractError(
+                "PLANNED_STOP_POI_MISSING",
+                "Unable to build planned stops because a solved POI is missing.",
+                details={"poi_id": poi_id},
+            )
+        if arrival is None or departure is None:
+            raise StateContractError(
+                "PLANNED_STOP_TIME_MISSING",
+                "Unable to build planned stops because solve timings are incomplete.",
+                details={"poi_id": poi_id, "sequence_order": index},
+            )
+        label = poi.name
         stops.append(
             _planned_stop(
                 sequence_order=index,
@@ -252,29 +332,34 @@ def _build_transient_planned_stops(
                 poi_name=label,
                 label=label,
                 node_kind="poi",
-                lat=poi.lat if poi is not None else None,
-                lng=poi.lng if poi is not None else None,
+                lat=poi.lat,
+                lng=poi.lng,
                 arrival_min=arrival,
                 departure_min=departure,
-                stay_min=(
-                    departure - arrival
-                    if arrival is not None and departure is not None
-                    else None
-                ),
+                stay_min=departure - arrival,
                 leg_from_prev_min=(
                     result.leg_minutes[index - 1]
                     if index - 1 < len(result.leg_minutes)
                     else None
                 ),
+                leg_polyline=_leg_polyline_for_stop(index, route_legs),
             )
         )
 
     end_index = len(result.ordered_poi_ids) + 1
-    end_arrival = (
-        result.arrival_minutes[len(result.ordered_poi_ids)]
-        if len(result.arrival_minutes) > len(result.ordered_poi_ids)
-        else trip.return_deadline_min
-    )
+    if len(result.arrival_minutes) <= len(result.ordered_poi_ids):
+        raise StateContractError(
+            "PLANNED_STOP_END_TIME_MISSING",
+            "Unable to build planned stops because end arrival is missing.",
+            details={"trip_id": trip.id},
+        )
+    end_arrival = result.arrival_minutes[len(result.ordered_poi_ids)]
+    if end_arrival is None:
+        raise StateContractError(
+            "PLANNED_STOP_END_TIME_MISSING",
+            "Unable to build planned stops because end arrival is null.",
+            details={"trip_id": trip.id},
+        )
     stops.append(
         _planned_stop(
             sequence_order=end_index,
@@ -288,12 +373,25 @@ def _build_transient_planned_stops(
             departure_min=end_arrival,
             stay_min=0,
             leg_from_prev_min=result.leg_minutes[-1] if result.leg_minutes else None,
+            leg_polyline=_leg_polyline_for_stop(end_index, route_legs),
         )
     )
     return stops
 
 
-def _get_latest_route(db: Session, trip_id: int) -> tuple[SolverRun | None, list[PlannedStopOut]]:
+def _serialize_route_legs(route_summary_json: dict[str, Any] | None) -> list[RouteLegOut]:
+    if route_summary_json is None:
+        return []
+    route_legs_raw = route_summary_json.get("route_legs")
+    if route_legs_raw is None:
+        raise StateContractError(
+            "SOLVE_SUMMARY_ROUTE_LEGS_MISSING",
+            "Latest solver run is missing canonical route leg data.",
+        )
+    return [RouteLegOut.model_validate(route_leg) for route_leg in route_legs_raw]
+
+
+def _get_latest_solve_snapshot(db: Session, trip_id: int) -> SolveSnapshotOut | None:
     run = (
         db.query(SolverRun)
         .filter(SolverRun.trip_id == trip_id)
@@ -301,26 +399,44 @@ def _get_latest_route(db: Session, trip_id: int) -> tuple[SolverRun | None, list
         .first()
     )
     if run is None:
-        return None, []
-    trip = run.trip
+        return None
+    if not isinstance(run.route_summary_json, dict):
+        raise StateContractError(
+            "SOLVE_SUMMARY_MISSING",
+            "Latest solver run is missing canonical summary data.",
+            details={"solver_run_id": run.id},
+        )
+    route_summary = run.route_summary_json
+    route_legs = _serialize_route_legs(route_summary)
     stops = (
         db.query(PlannedStop)
         .filter(PlannedStop.solver_run_id == run.id)
         .order_by(PlannedStop.sequence_order)
         .all()
     )
-    return run, [
+    serialized_stops = [
         _serialize_planned_stop(
             stop,
-            start_label=trip.origin_label if trip is not None else None,
-            start_lat=trip.origin_lat if trip is not None else None,
-            start_lng=trip.origin_lng if trip is not None else None,
-            end_label=trip.dest_label if trip is not None else None,
-            end_lat=trip.dest_lat if trip is not None else None,
-            end_lng=trip.dest_lng if trip is not None else None,
+            leg_polyline=_leg_polyline_for_stop(
+                stop.sequence_order,
+                route_legs,
+            ),
         )
         for stop in stops
     ]
+    return SolveSnapshotOut(
+        feasible=bool(route_summary.get("feasible")),
+        objective=run.objective_value,
+        ordered_poi_ids=list(route_summary.get("ordered_poi_ids") or []),
+        reason_codes=list(route_summary.get("reason_codes") or []),
+        solve_ms=run.solve_ms,
+        solver_run_id=run.id,
+        used_bucket=str(route_summary.get("used_bucket") or "departure"),
+        used_traffic_matrix=bool(route_summary.get("used_traffic_matrix")),
+        shortlist_ids=list(route_summary.get("shortlist_ids") or []),
+        planned_stops=serialized_stops,
+        route_legs=route_legs,
+    )
 
 
 def _serialize_trip_detail(db: Session, trip: TripPlan) -> TripDetailOut:
@@ -330,7 +446,6 @@ def _serialize_trip_detail(db: Session, trip: TripPlan) -> TripDetailOut:
         .order_by(TripCandidate.id.asc())
         .all()
     )
-    latest_run, latest_route = _get_latest_route(db, trip.id)
     return TripDetailOut(
         id=trip.id,
         state=trip.state,
@@ -347,10 +462,138 @@ def _serialize_trip_detail(db: Session, trip: TripPlan) -> TripDetailOut:
         weather_mode=trip.weather_mode,
         preference_profile=_serialize_preference(trip.preference_profile),
         candidates=[_serialize_candidate(candidate) for candidate in candidates],
-        latest_route=latest_route,
-        latest_solver_run=(
-            SolverRunOut.model_validate(latest_run) if latest_run is not None else None
-        ),
+        latest_solve=_get_latest_solve_snapshot(db, trip.id),
+    )
+
+
+def _extract_event_poi_id(event: TripExecutionEvent) -> int | None:
+    if event.payload_json is None:
+        return None
+    if not isinstance(event.payload_json, dict):
+        raise StateContractError(
+            "EVENT_PAYLOAD_INVALID",
+            "Trip execution event payload must be an object.",
+            details={"event_id": event.id, "event_type": event.event_type},
+        )
+    poi_id = event.payload_json.get("poi_id")
+    if poi_id is None:
+        return None
+    if not isinstance(poi_id, int):
+        raise StateContractError(
+            "EVENT_PAYLOAD_INVALID",
+            "Trip execution event payload.poi_id must be an integer.",
+            details={"event_id": event.id, "event_type": event.event_type},
+        )
+    return poi_id
+
+
+def _first_remaining_poi_stop(
+    stops: list[PlannedStopOut],
+    completed_poi_ids: list[int],
+    *,
+    exclude_poi_id: int | None = None,
+) -> PlannedStopOut | None:
+    for stop in stops:
+        if stop.node_kind != "poi" or stop.poi_id is None:
+            continue
+        if exclude_poi_id is not None and stop.poi_id == exclude_poi_id:
+            continue
+        if stop.poi_id not in completed_poi_ids:
+            return stop
+    return None
+
+
+def _derive_active_trip_state(
+    solve_snapshot: SolveSnapshotOut | None,
+    events: list[TripExecutionEvent],
+) -> ActiveTripStateOut:
+    stops = [] if solve_snapshot is None else solve_snapshot.planned_stops
+    completed_poi_ids: list[int] = []
+    in_progress_poi_id: int | None = None
+    for event in events:
+        poi_id = _extract_event_poi_id(event)
+        if event.event_type == "arrived":
+            if poi_id is None:
+                raise StateContractError(
+                    "EVENT_PAYLOAD_INVALID",
+                    "arrived events require payload.poi_id.",
+                    details={"event_id": event.id},
+                )
+            in_progress_poi_id = poi_id
+        elif event.event_type == "departed":
+            if in_progress_poi_id is not None:
+                completed_poi_ids.append(in_progress_poi_id)
+            in_progress_poi_id = None
+        elif event.event_type == "skipped":
+            if poi_id is None:
+                raise StateContractError(
+                    "EVENT_PAYLOAD_INVALID",
+                    "skipped events require payload.poi_id.",
+                    details={"event_id": event.id},
+                )
+            completed_poi_ids.append(poi_id)
+            if in_progress_poi_id == poi_id:
+                in_progress_poi_id = None
+
+    poi_stops = [stop for stop in stops if stop.node_kind == "poi"]
+    current_stop = (
+        next((stop for stop in poi_stops if stop.poi_id == in_progress_poi_id), None)
+        if in_progress_poi_id is not None
+        else _first_remaining_poi_stop(poi_stops, completed_poi_ids)
+    )
+
+    if in_progress_poi_id is not None:
+        current_index = (
+            -1
+            if current_stop is None
+            else next(
+                (
+                    index
+                    for index, stop in enumerate(stops)
+                    if stop.poi_id == current_stop.poi_id
+                ),
+                -1,
+            )
+        )
+        next_stop = (
+            next(
+                (stop for stop in stops[current_index + 1 :] if stop.node_kind == "poi"),
+                None,
+            )
+            if current_index >= 0
+            else _first_remaining_poi_stop(
+                poi_stops,
+                completed_poi_ids,
+                exclude_poi_id=in_progress_poi_id,
+            )
+        )
+    else:
+        current_index = (
+            -1
+            if current_stop is None
+            else next(
+                (
+                    index
+                    for index, stop in enumerate(stops)
+                    if stop.poi_id == current_stop.poi_id
+                ),
+                -1,
+            )
+        )
+        next_stop = (
+            next(
+                (stop for stop in stops[current_index + 1 :] if stop.node_kind == "poi"),
+                None,
+            )
+            if current_index >= 0
+            else None
+        )
+
+    return ActiveTripStateOut(
+        completed_poi_ids=completed_poi_ids,
+        in_progress_poi_id=in_progress_poi_id,
+        current_stop=current_stop,
+        next_stop=next_stop,
     )
 
 
@@ -544,6 +787,10 @@ def _solve_response(
     planned_stops: list[PlannedStopOut],
     *,
     run_id: int,
+    used_bucket: str,
+    used_traffic_matrix: bool,
+    shortlist_ids: list[int],
+    route_legs: list[RouteLegOut],
     alternatives: list[CandidateOut] | None = None,
 ) -> SolveResponse:
     return SolveResponse(
@@ -552,7 +799,11 @@ def _solve_response(
         ordered_poi_ids=result.ordered_poi_ids,
         reason_codes=result.reason_codes,
         solve_ms=result.solve_ms,
+        used_bucket=used_bucket,
+        used_traffic_matrix=used_traffic_matrix,
+        shortlist_ids=shortlist_ids,
         planned_stops=planned_stops,
+        route_legs=route_legs,
         solver_run_id=run_id,
         alternatives=alternatives or [],
     )
@@ -708,15 +959,15 @@ def delete_candidate(
     return {"ok": True}
 
 
-@router.post("/{trip_id}/events")
+@router.post("/{trip_id}/events", response_model=EventOut)
 def post_event(
     trip_id: int, body: EventCreate, db: Session = Depends(get_db)
-) -> dict[str, Any]:
+) -> TripExecutionEvent:
     _get_trip_or_404(db, trip_id)
-    event = _append_event(db, trip_id, body.event_type, body.payload or {})
+    event = _append_event(db, trip_id, body.event_type, body.payload)
     db.commit()
     db.refresh(event)
-    return {"id": event.id, "event_type": event.event_type}
+    return event
 
 
 @router.get("/{trip_id}/events", response_model=list[EventOut])
@@ -759,6 +1010,19 @@ async def solve_endpoint(
     )
     result = pipeline.solver_result
     started_at = datetime.now(timezone.utc)
+    planned_stops = _build_transient_planned_stops(
+        db,
+        trip,
+        result,
+        route_legs=None,
+    )
+    route_legs = _build_route_legs(planned_stops, pipeline.refined_legs)
+    planned_stops = _build_transient_planned_stops(
+        db,
+        trip,
+        result,
+        route_legs=route_legs,
+    )
     input_hash = _hash_solver_payload(
         {
             "ids": state["candidate_ids"],
@@ -780,16 +1044,24 @@ async def solve_endpoint(
         summary={
             "reason_codes": result.reason_codes,
             "feasible": result.feasible,
+            "ordered_poi_ids": result.ordered_poi_ids,
             "shortlist_ids": pipeline.shortlist_ids,
             "used_bucket": pipeline.used_bucket,
             "used_traffic_matrix": pipeline.used_traffic_matrix,
-            "refined_legs": pipeline.refined_legs,
+            "route_legs": [route_leg.model_dump() for route_leg in route_legs],
         },
     )
-    planned_stops = _build_transient_planned_stops(db, trip, result)
     _persist_planned_stops(db, run.id, planned_stops)
     db.commit()
-    return _solve_response(result, planned_stops, run_id=run.id)
+    return _solve_response(
+        result,
+        planned_stops,
+        run_id=run.id,
+        used_bucket=pipeline.used_bucket,
+        used_traffic_matrix=pipeline.used_traffic_matrix,
+        shortlist_ids=pipeline.shortlist_ids,
+        route_legs=route_legs,
+    )
 
 
 @router.post("/{trip_id}/replan", response_model=SolveResponse)
@@ -826,6 +1098,26 @@ async def replan_endpoint(
         now_minute=ctx.now_minute,
     )
     result = pipeline.solver_result
+    start_label, start_lat, start_lng = _resolve_replan_start_metadata(db, trip, ctx)
+    planned_stops = _build_transient_planned_stops(
+        db,
+        trip,
+        result,
+        start_label=start_label,
+        start_lat=start_lat,
+        start_lng=start_lng,
+        route_legs=None,
+    )
+    route_legs = _build_route_legs(planned_stops, pipeline.refined_legs)
+    planned_stops = _build_transient_planned_stops(
+        db,
+        trip,
+        result,
+        start_label=start_label,
+        start_lat=start_lat,
+        start_lng=start_lng,
+        route_legs=route_legs,
+    )
     input_hash = _hash_solver_payload(
         {
             "kind": "replan",
@@ -858,19 +1150,12 @@ async def replan_endpoint(
             "kind": "replan",
             "reason_codes": result.reason_codes,
             "feasible": result.feasible,
+            "ordered_poi_ids": result.ordered_poi_ids,
             "shortlist_ids": pipeline.shortlist_ids,
             "used_bucket": pipeline.used_bucket,
             "used_traffic_matrix": pipeline.used_traffic_matrix,
+            "route_legs": [route_leg.model_dump() for route_leg in route_legs],
         },
-    )
-    start_label, start_lat, start_lng = _resolve_replan_start_metadata(db, trip, ctx)
-    planned_stops = _build_transient_planned_stops(
-        db,
-        trip,
-        result,
-        start_label=start_label,
-        start_lat=start_lat,
-        start_lng=start_lng,
     )
     _persist_planned_stops(db, run.id, planned_stops)
     _append_event(
@@ -900,14 +1185,49 @@ async def replan_endpoint(
         result,
         planned_stops,
         run_id=run.id,
+        used_bucket=pipeline.used_bucket,
+        used_traffic_matrix=pipeline.used_traffic_matrix,
+        shortlist_ids=pipeline.shortlist_ids,
+        route_legs=route_legs,
         alternatives=[_serialize_candidate(candidate) for candidate in alternative_candidates],
     )
 
 
 @router.get("/{trip_id}/route-preview", response_model=RoutePreviewOut)
 def route_preview(trip_id: int, db: Session = Depends(get_db)) -> RoutePreviewOut:
-    _run, stops = _get_latest_route(db, _get_trip_or_404(db, trip_id).id)
-    return RoutePreviewOut(stops=stops)
+    solve = _get_latest_solve_snapshot(db, _get_trip_or_404(db, trip_id).id)
+    return RoutePreviewOut(solve=solve)
+
+
+@router.get(
+    "/{trip_id}/active-bootstrap",
+    response_model=ActiveTripBootstrapOut,
+)
+def active_bootstrap(
+    trip_id: int,
+    db: Session = Depends(get_db),
+) -> ActiveTripBootstrapOut:
+    trip = _get_trip_or_404(db, trip_id)
+    trip_detail = _serialize_trip_detail(db, trip)
+    events = (
+        db.query(TripExecutionEvent)
+        .filter(TripExecutionEvent.trip_id == trip_id)
+        .order_by(TripExecutionEvent.recorded_at.asc())
+        .all()
+    )
+    pois = (
+        db.query(PoiMaster)
+        .filter(PoiMaster.primary_category.notin_(tuple(INTERNAL_TRIP_POI_CATEGORIES)))
+        .filter(PoiMaster.is_active.is_(True))
+        .order_by(PoiMaster.id)
+        .all()
+    )
+    return ActiveTripBootstrapOut(
+        trip=trip_detail,
+        events=[EventOut.model_validate(event) for event in events],
+        pois=[PoiOut.model_validate(poi) for poi in pois],
+        active_state=_derive_active_trip_state(trip_detail.latest_solve, events),
+    )
 
 
 @router.get("/{trip_id}/solver-runs", response_model=list[SolverRunOut])

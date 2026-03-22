@@ -8,12 +8,15 @@ from datetime import date
 from app.config import settings
 from app.models.poi import PoiDependencyRule, PoiMaster, PoiOpeningRule
 from app.models.trip import TripCandidate
+from app.services.geo import estimate_drive_minutes
+from app.services.google_places import RouteLegDetails
 from app.services.routing_costs import build_solve_pipeline
 from app.solver.model import SolverInput, SolverResult, solve_trip
 from tests.helpers import add_custom_poi, create_trip, setup_seeded_db, solve_for_trip
 
 
 def build_custom_solver_input(
+    db,
     candidate_ids: list[int],
     *,
     driving_penalty_weight: float = 0.05,
@@ -23,6 +26,32 @@ def build_custom_solver_input(
     budget_band: str | None = None,
     pace_style: str = "balanced",
 ) -> SolverInput:
+    poi_rows = db.query(PoiMaster).filter(PoiMaster.id.in_(candidate_ids)).all()
+    poi_by_id = {poi.id: poi for poi in poi_rows}
+    matrix_node_ids = [-1, *candidate_ids, -2]
+    coords_by_node = {
+        -1: (35.0, 139.0),
+        -2: (35.0, 139.0),
+        **{
+            poi_id: (poi_by_id[poi_id].lat, poi_by_id[poi_id].lng)
+            for poi_id in candidate_ids
+            if poi_id in poi_by_id
+        },
+    }
+    travel_matrix = [
+        [
+            0
+            if origin_node == destination_node
+            else estimate_drive_minutes(
+                coords_by_node[origin_node][0],
+                coords_by_node[origin_node][1],
+                coords_by_node[destination_node][0],
+                coords_by_node[destination_node][1],
+            )
+            for destination_node in matrix_node_ids
+        ]
+        for origin_node in matrix_node_ids
+    ]
     return SolverInput(
         origin_lat=35.0,
         origin_lng=139.0,
@@ -41,6 +70,8 @@ def build_custom_solver_input(
         must_have_cafe=must_have_cafe,
         budget_band=budget_band,
         pace_style=pace_style,
+        matrix_node_ids=matrix_node_ids,
+        travel_matrix=travel_matrix,
     )
 
 
@@ -147,6 +178,7 @@ def test_weekday_specific_opening_rules_are_closed_on_non_matching_days() -> Non
         lat=35.05,
         lng=139.05,
         utility_default=100,
+        with_default_opening_rule=False,
     )
     db.add(
         PoiOpeningRule(
@@ -163,11 +195,11 @@ def test_weekday_specific_opening_rules_are_closed_on_non_matching_days() -> Non
     db.commit()
 
     candidate_ids = [lunch.id, dinner.id, sweets.id, sunset.id, closed_hub.id]
-    optional_input = build_custom_solver_input(candidate_ids)
+    optional_input = build_custom_solver_input(db, candidate_ids)
     optional_input.plan_date = date(2026, 3, 23)
     optional_result = solve_trip(db, optional_input)
 
-    must_visit_input = build_custom_solver_input(candidate_ids)
+    must_visit_input = build_custom_solver_input(db, candidate_ids)
     must_visit_input.plan_date = date(2026, 3, 23)
     must_visit_input.must_visit = {closed_hub.id}
     must_visit_result = solve_trip(db, must_visit_input)
@@ -228,11 +260,11 @@ def test_traffic_pipeline_selects_dinner_bucket(monkeypatch) -> None:
 
     async def fake_refine_legs(legs):
         return [
-            {
-                "duration_minutes": 14,
-                "polyline": {"encodedPolyline": "mock"},
-                "distance_meters": 12000,
-            }
+            RouteLegDetails(
+                duration_minutes=14,
+                polyline="mock",
+                distance_meters=12000,
+            )
             for _ in legs
         ]
 
@@ -335,10 +367,11 @@ def test_preferred_meal_tags_affect_route_choice() -> None:
         sunset.id,
     ]
 
-    base = solve_trip(db, build_custom_solver_input(candidate_ids))
+    base = solve_trip(db, build_custom_solver_input(db, candidate_ids))
     preferred = solve_trip(
         db,
         build_custom_solver_input(
+            db,
             candidate_ids,
             preferred_lunch_tags={"seafood"},
             preferred_dinner_tags={"romantic"},
@@ -398,10 +431,10 @@ def test_must_have_cafe_selects_cafe_stop() -> None:
     )
     candidate_ids = [lunch.id, dinner.id, sweets_cafe.id, sweets_plain.id, sunset.id]
 
-    base = solve_trip(db, build_custom_solver_input(candidate_ids))
+    base = solve_trip(db, build_custom_solver_input(db, candidate_ids))
     with_cafe = solve_trip(
         db,
-        build_custom_solver_input(candidate_ids, must_have_cafe=True),
+        build_custom_solver_input(db, candidate_ids, must_have_cafe=True),
     )
     db.close()
 
@@ -436,6 +469,7 @@ def test_missing_cafe_candidate_is_infeasible() -> None:
     result = solve_trip(
         db,
         build_custom_solver_input(
+            db,
             [lunch.id, dinner.id, sweets.id],
             must_have_cafe=True,
         ),
@@ -494,10 +528,10 @@ def test_budget_band_affects_dinner_selection() -> None:
     )
     candidate_ids = [lunch.id, sweets.id, dinner_casual.id, dinner_premium.id, sunset.id]
 
-    base = solve_trip(db, build_custom_solver_input(candidate_ids))
+    base = solve_trip(db, build_custom_solver_input(db, candidate_ids))
     casual = solve_trip(
         db,
-        build_custom_solver_input(candidate_ids, budget_band="casual"),
+        build_custom_solver_input(db, candidate_ids, budget_band="casual"),
     )
     db.close()
 
@@ -564,6 +598,7 @@ def test_pace_style_changes_stop_count_and_stay_bounds() -> None:
     relaxed = solve_trip(
         db,
         build_custom_solver_input(
+            db,
             candidate_ids,
             driving_penalty_weight=0.2,
             pace_style="relaxed",
@@ -572,6 +607,7 @@ def test_pace_style_changes_stop_count_and_stay_bounds() -> None:
     packed = solve_trip(
         db,
         build_custom_solver_input(
+            db,
             candidate_ids,
             driving_penalty_weight=0.2,
             pace_style="packed",
@@ -680,7 +716,7 @@ def test_heuristic_solver_honors_database_dependencies() -> None:
         dependency_target.id,
         *[hub.id for hub in filler_hubs],
     ]
-    result = solve_trip(db, build_custom_solver_input(candidate_ids))
+    result = solve_trip(db, build_custom_solver_input(db, candidate_ids))
     db.close()
 
     assert len(candidate_ids) > 12
