@@ -1,6 +1,6 @@
-import { API_BASE } from "@/lib/runtime-config";
+import { getApiBase } from "@/lib/runtime-config";
 
-function readApiErrorMessage(payload: unknown, fallback: string): string {
+function readApiError(payload: unknown, fallback: string): string {
   if (
     payload &&
     typeof payload === "object" &&
@@ -23,19 +23,17 @@ function readApiErrorMessage(payload: unknown, fallback: string): string {
   return fallback;
 }
 
-export async function api<T>(
-  path: string,
-  init?: RequestInit,
-): Promise<T> {
-  const r = await fetch(`${API_BASE}${path}`, {
+export async function api<T>(path: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(`${getApiBase()}${path}`, {
     ...init,
     headers: {
       "Content-Type": "application/json",
       ...(init?.headers || {}),
     },
+    cache: "no-store",
   });
-  if (!r.ok) {
-    const text = await r.text();
+  if (!response.ok) {
+    const text = await response.text();
     let payload: unknown = null;
     if (text) {
       try {
@@ -44,7 +42,7 @@ export async function api<T>(
         payload = null;
       }
     }
-    throw new Error(readApiErrorMessage(payload, text || r.statusText));
+    throw new Error(readApiError(payload, text || response.statusText));
   }
-  return r.json() as Promise<T>;
+  return response.json() as Promise<T>;
 }

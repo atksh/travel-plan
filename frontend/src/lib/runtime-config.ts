@@ -1,12 +1,15 @@
-const apiBase = process.env.NEXT_PUBLIC_API_URL;
-if (!apiBase) {
-  throw new Error("NEXT_PUBLIC_API_URL is required");
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`${name} is required`);
+  }
+  return value;
 }
 
-const googleMapsApiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
-if (!googleMapsApiKey) {
-  throw new Error("NEXT_PUBLIC_GOOGLE_MAPS_API_KEY is required");
+export function getApiBase(): string {
+  return requireEnv("NEXT_PUBLIC_API_URL");
 }
 
-export const API_BASE = apiBase;
-export const GOOGLE_MAPS_API_KEY = googleMapsApiKey;
+export function getGoogleMapsApiKey(): string {
+  return requireEnv("NEXT_PUBLIC_GOOGLE_MAPS_API_KEY");
+}

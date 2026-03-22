@@ -2,383 +2,202 @@
 
 import Link from "next/link";
 import { useParams } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
-import {
-  appleMapsHref,
-  formatDuration,
-  formatMinute,
-  googleMapsHref,
-  humanizeReason,
-} from "@/lib/format";
+import { useEffect, useMemo, useState } from "react";
 import { api } from "@/lib/api";
-import { useOnlineStatus } from "@/lib/offline-cache";
-import { buildRoutePoints } from "@/lib/stops";
-import { RouteMap } from "@/components/RouteMap";
-import type { CandidateOut, PlannedStopOut, SolveResponse, TripDetailOut } from "@/lib/types";
+import { CompareDrawer } from "@/components/planning/CompareDrawer";
+import { CandidateBucket } from "@/components/planning/CandidateBucket";
+import { ExplanationPanel } from "@/components/planning/ExplanationPanel";
+import { PlanningMapCanvas } from "@/components/planning/PlanningMapCanvas";
+import { RuleBuilder } from "@/components/planning/RuleBuilder";
+import { SolveSummaryBar } from "@/components/planning/SolveSummaryBar";
+import { TimelineEditor } from "@/components/planning/TimelineEditor";
+import type { PlaceSummary, PreviewResponse, SolveAcceptedResponse, TripWorkspace } from "@/lib/types";
 
-function MapButtons({
-  currentPoint,
-  nextPoint,
-}: {
-  currentPoint: { lat: number; lng: number } | null | undefined;
-  nextPoint: { lat: number; lng: number } | null | undefined;
-}) {
-  if (!currentPoint || !nextPoint) {
-    return null;
-  }
-  return (
-    <div className="button-row" style={{ marginTop: "0.75rem" }}>
-      {[
-        { label: "Apple Maps", hrefBuilder: appleMapsHref },
-        { label: "Google Maps", hrefBuilder: googleMapsHref },
-      ].map(({ label, hrefBuilder }) => (
-        <a
-          key={label}
-          className="small-button"
-          href={hrefBuilder(
-            currentPoint.lat,
-            currentPoint.lng,
-            nextPoint.lat,
-            nextPoint.lng,
-          )}
-          rel="noreferrer"
-          target="_blank"
-        >
-          {label}
-        </a>
-      ))}
-    </div>
-  );
-}
-
-function PlanTimelineSection({
-  stops,
-}: {
-  stops: PlannedStopOut[];
-}) {
-  const points = buildRoutePoints(stops);
-  return (
-    <section className="panel">
-      <div className="section-heading">
-        <h2>Timeline</h2>
-        <p>Arrival, stay, and leg time for the current best route.</p>
-      </div>
-      <div className="timeline">
-        {stops.map((stop, index) => (
-          <article key={`${stop.sequence_order}-${stop.poi_id ?? stop.node_kind}`} className="timeline-stop">
-            <div className="timeline-header">
-              <div>
-                <div className="timeline-title">{stop.poi_name || stop.node_kind}</div>
-                <div className="timeline-meta">
-                  {formatMinute(stop.arrival_min)} - {formatMinute(stop.departure_min)}
-                </div>
-              </div>
-              <div className="status-pill">
-                <span>{stop.node_kind}</span>
-              </div>
-            </div>
-            <div className="timeline-meta">
-              Stay {formatDuration(stop.stay_min)} | Drive from previous{" "}
-              {formatDuration(stop.leg_from_prev_min)}
-            </div>
-            <MapButtons currentPoint={points[index]} nextPoint={points[index + 1]} />
-          </article>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-function ReasonListSection({ reasonCodes }: { reasonCodes: string[] }) {
-  return (
-    <section className="panel">
-      <div className="section-heading">
-        <h2>Why this plan</h2>
-        <p>
-          {reasonCodes.length === 0
-            ? "No warnings. The current route satisfies the active constraints."
-            : "Machine-readable reason codes translated into short notes."}
-        </p>
-      </div>
-      {reasonCodes.length > 0 ? (
-        <div className="reason-list">
-          {reasonCodes.map((code) => (
-            <div key={code} className="reason-chip">
-              {humanizeReason(code)}
-            </div>
-          ))}
-        </div>
-      ) : null}
-    </section>
-  );
-}
-
-function CandidateBoardSection({
-  tripId,
-  candidates,
-  onChanged,
-  readOnly,
-}: {
-  tripId: string;
-  candidates: CandidateOut[];
-  onChanged: () => Promise<void>;
-  readOnly: boolean;
-}) {
-  const [busyId, setBusyId] = useState<number | null>(null);
+export default function TripWorkspacePage() {
+  const params = useParams<{ id: string }>();
+  const tripId = params.id;
+  const [workspace, setWorkspace] = useState<TripWorkspace | null>(null);
+  const [places, setPlaces] = useState<PlaceSummary[]>([]);
+  const [preview, setPreview] = useState<PreviewResponse | null>(null);
+  const [orderedPlaceIds, setOrderedPlaceIds] = useState<number[]>([]);
+  const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  async function mutateCandidate(candidateId: number, init: RequestInit, fallback: string) {
-    setBusyId(candidateId);
-    setError(null);
+  async function loadWorkspace() {
     try {
-      await api(`/api/trips/${tripId}/candidates/${candidateId}`, init);
-      await onChanged();
-    } catch (mutationError) {
-      setError(mutationError instanceof Error ? mutationError.message : fallback);
-    } finally {
-      setBusyId(null);
+      const [workspaceResponse, placesResponse] = await Promise.all([
+        api<TripWorkspace>(`/api/trips/${tripId}`),
+        api<{ items: PlaceSummary[] }>("/api/places"),
+      ]);
+      setWorkspace(workspaceResponse);
+      setPlaces(placesResponse.items);
+      setOrderedPlaceIds(
+        workspaceResponse.latest_accepted_run?.selected_place_ids ?? workspaceResponse.candidates.map((candidate) => candidate.place_id),
+      );
+      setError(null);
+    } catch (loadError) {
+      setError(loadError instanceof Error ? loadError.message : "読み込みに失敗しました。");
     }
   }
 
-  return (
-    <section className="panel">
-      <div className="section-heading">
-        <h2>Trip candidates</h2>
-        <p>
-          {readOnly
-            ? "Offline mode is read-only. Reconnect to edit candidates."
-            : "Adjust must-visit and exclude flags without touching the master POI list."}
-        </p>
-      </div>
-      {error ? <p className="error-text">{error}</p> : null}
-      <div className="stack">
-        {candidates.map((candidate) => (
-          <article key={candidate.id} className="candidate-item">
-            <div className="candidate-header">
-              <div>
-                <div className="candidate-title">{candidate.poi_name}</div>
-                <div className="timeline-meta">
-                  {candidate.primary_category} | {candidate.source}
-                </div>
-              </div>
-              <div className="status-pill">
-                <span>{candidate.status}</span>
-              </div>
-            </div>
-            <div className="button-row" style={{ marginTop: "0.85rem" }}>
-              <button
-                className={candidate.must_visit ? "tag-chip tag-chip-active" : "tag-chip"}
-                disabled={readOnly || busyId === candidate.id}
-                type="button"
-                onClick={() =>
-                  void mutateCandidate(
-                    candidate.id,
-                    {
-                      method: "PATCH",
-                      body: JSON.stringify({
-                        must_visit: !candidate.must_visit,
-                        excluded: false,
-                      }),
-                    },
-                    "Action failed",
-                  )
-                }
-              >
-                {candidate.must_visit ? "Must visit" : "Make must"}
-              </button>
-              <button
-                className={candidate.excluded ? "tag-chip tag-chip-active" : "tag-chip"}
-                disabled={readOnly || busyId === candidate.id}
-                type="button"
-                onClick={() =>
-                  void mutateCandidate(
-                    candidate.id,
-                    {
-                      method: "PATCH",
-                      body: JSON.stringify({
-                        excluded: !candidate.excluded,
-                        must_visit: false,
-                      }),
-                    },
-                    "Action failed",
-                  )
-                }
-              >
-                {candidate.excluded ? "Excluded" : "Exclude"}
-              </button>
-              <button
-                className="tag-chip"
-                disabled={readOnly || busyId === candidate.id}
-                type="button"
-                onClick={() =>
-                  void mutateCandidate(candidate.id, { method: "DELETE" }, "Delete failed")
-                }
-              >
-                Remove
-              </button>
-            </div>
-          </article>
-        ))}
-      </div>
-    </section>
-  );
-}
-
-export default function TripPage() {
-  const params = useParams();
-  const id = String(params.id);
-  const [trip, setTrip] = useState<TripDetailOut | null>(null);
-  const [err, setErr] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [useTraffic, setUseTraffic] = useState(true);
-  const isOnline = useOnlineStatus();
-
-  const loadTripData = useCallback(async () => {
-    setErr(null);
-    const tripData = await api<TripDetailOut>(`/api/trips/${id}`);
-    setTrip(tripData);
-  }, [id]);
-
-  const runSolve = useCallback(
-    async (traffic: boolean) => {
-      if (!isOnline) {
-        setErr("Cannot solve while offline.");
-        return;
-      }
-      setErr(null);
-      setLoading(true);
-      try {
-        await api<SolveResponse>(`/api/trips/${id}/solve`, {
-          method: "POST",
-          body: JSON.stringify({ use_traffic_matrix: traffic }),
-        });
-        await loadTripData();
-      } catch (solveError) {
-        setErr(solveError instanceof Error ? solveError.message : "Error");
-      } finally {
-        setLoading(false);
-      }
-    },
-    [id, isOnline, loadTripData],
-  );
-
-  const refreshAfterCandidateChange = useCallback(async () => {
-    await runSolve(useTraffic);
-  }, [runSolve, useTraffic]);
+  useEffect(() => {
+    void loadWorkspace();
+  }, [tripId]);
 
   useEffect(() => {
-    void loadTripData().catch((loadError) => {
-      setErr(loadError instanceof Error ? loadError.message : "Failed to load trip.");
-    });
-  }, [loadTripData]);
+    if (!workspace || orderedPlaceIds.length === 0) {
+      return;
+    }
+    const timer = window.setTimeout(async () => {
+      try {
+        const nextPreview = await api<PreviewResponse>(`/api/trips/${tripId}/preview`, {
+          method: "POST",
+          body: JSON.stringify({
+            workspace_version: workspace.workspace_version,
+            draft_order_edits: orderedPlaceIds,
+          }),
+        });
+        setPreview(nextPreview);
+      } catch (previewError) {
+        setError(previewError instanceof Error ? previewError.message : "プレビューに失敗しました。");
+      }
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [orderedPlaceIds, tripId, workspace]);
 
-  const latestSolve = trip?.latest_solve ?? null;
-  const plannedStops = latestSolve?.planned_stops ?? [];
+  const candidatePlaceIds = useMemo(
+    () => new Set(workspace?.candidates.map((candidate) => candidate.place_id) ?? []),
+    [workspace],
+  );
+  const addablePlaces = places.filter((place) => !candidatePlaceIds.has(place.id) && !place.archived);
+
+  async function addCandidate(placeId: number) {
+    setBusy(true);
+    try {
+      await api(`/api/trips/${tripId}/candidates`, {
+        method: "POST",
+        body: JSON.stringify({ place_id: placeId, priority: "normal" }),
+      });
+      await loadWorkspace();
+    } catch (mutationError) {
+      setError(mutationError instanceof Error ? mutationError.message : "候補追加に失敗しました。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function createRule(payload: Record<string, unknown>) {
+    setBusy(true);
+    try {
+      await api(`/api/trips/${tripId}/rules`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      await loadWorkspace();
+    } catch (mutationError) {
+      setError(mutationError instanceof Error ? mutationError.message : "ルール追加に失敗しました。");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function acceptCurrentPlan() {
+    if (!workspace) {
+      return;
+    }
+    setBusy(true);
+    try {
+      const response = await api<SolveAcceptedResponse>(`/api/trips/${tripId}/solve`, {
+        method: "POST",
+        body: JSON.stringify(
+          preview
+            ? { workspace_version: workspace.workspace_version, preview_id: preview.preview_id }
+            : { workspace_version: workspace.workspace_version },
+        ),
+      });
+      setPreview(null);
+      await loadWorkspace();
+      setOrderedPlaceIds(response.solve.selected_place_ids);
+    } catch (solveError) {
+      setError(solveError instanceof Error ? solveError.message : "計画の確定に失敗しました。");
+    } finally {
+      setBusy(false);
+    }
+  }
 
   return (
     <main className="page-shell">
       <div className="page-frame stack">
         <section className="hero-panel">
           <div className="section-heading">
-            <span className="eyebrow">Plan view</span>
-            <h1>Trip {id}</h1>
-            <p>
-              Solve the reduced graph, inspect the timeline, and adjust candidate
-              flags before you leave.
-            </p>
+            <span className="eyebrow">Planning Workspace</span>
+            <h1>{workspace?.trip.title ?? "旅行ワークスペース"}</h1>
+            <p>候補、ルール、プレビュー、比較、実行開始をひとつの画面で行います。</p>
           </div>
           <div className="button-row">
-            <button
-              className="primary-button"
-              disabled={loading || !isOnline}
-              type="button"
-              onClick={() => void runSolve(useTraffic)}
-            >
-              {loading ? "Solving…" : "Re-solve"}
+            <button className="primary-button" type="button" disabled={busy || !workspace} onClick={() => void acceptCurrentPlan()}>
+              プレビューを確定
             </button>
-            <Link className="secondary-button" href={`/trips/${id}/active`}>
-              Active trip
+            <Link className="secondary-button" href={`/trips/${tripId}/compare`}>
+              比較ページ
             </Link>
-            <label className="checkbox-field">
-              <input
-                checked={useTraffic}
-                type="checkbox"
-                onChange={(event) => setUseTraffic(event.target.checked)}
-              />
-              <span>Use traffic-aware matrix</span>
-            </label>
-            {!isOnline ? <div className="offline-badge">Offline read-only mode</div> : null}
+            <Link className="secondary-button" href={`/trips/${tripId}/execute`}>
+              実行ページ
+            </Link>
           </div>
-          {latestSolve ? (
-            <div className="summary-row">
-              <div className="summary-pill">
-                <span>Feasible</span>
-                <strong>{String(latestSolve.feasible)}</strong>
-              </div>
-              <div className="summary-pill">
-                <span>Objective</span>
-                <strong>{latestSolve.objective ?? "—"}</strong>
-              </div>
-              <div className="summary-pill">
-                <span>Solve time</span>
-                <strong>{latestSolve.solve_ms} ms</strong>
-              </div>
-            </div>
-          ) : null}
         </section>
-
-        {err ? <p className="error-text">{err}</p> : null}
-
-        {trip ? (
+        {error ? <p className="error-text">{error}</p> : null}
+        {!workspace ? (
+          <section className="panel">
+            <div className="empty-card">読み込み中...</div>
+          </section>
+        ) : (
           <>
-            <div className="split-panel">
-              <PlanTimelineSection stops={plannedStops} />
+            <div className="workspace-grid">
               <div className="stack">
-                <RouteMap
-                  stops={plannedStops}
-                  routeLegs={latestSolve?.route_legs ?? []}
+                <section className="panel">
+                  <div className="section-heading">
+                    <h2>場所追加</h2>
+                    <p>ライブラリから旅行候補を追加します。</p>
+                  </div>
+                  <div className="stack">
+                    {addablePlaces.slice(0, 6).map((place) => (
+                      <article key={place.id} className="candidate-card">
+                        <div>
+                          <div className="candidate-title">{place.name}</div>
+                          <div className="candidate-meta">{place.category ?? "未分類"}</div>
+                        </div>
+                        <button className="small-button" type="button" disabled={busy} onClick={() => void addCandidate(place.id)}>
+                          追加
+                        </button>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+                <CandidateBucket
+                  candidates={workspace.candidates}
+                  orderedPlaceIds={orderedPlaceIds}
+                  onAdd={(placeId) => setOrderedPlaceIds((current) => [...current, placeId])}
                 />
-                <ReasonListSection reasonCodes={latestSolve?.reason_codes ?? []} />
+                <RuleBuilder candidates={workspace.candidates} rules={workspace.rules} onCreateRule={createRule} />
               </div>
-            </div>
-
-            <div className="split-panel">
-              <CandidateBoardSection
-                tripId={id}
-                candidates={trip.candidates}
-                onChanged={refreshAfterCandidateChange}
-                readOnly={!isOnline}
-              />
-              <section className="panel">
-                <div className="section-heading">
-                  <h2>Solver notes</h2>
-                  <p>The latest route and run summary stored on the backend.</p>
-                </div>
-                <div className="stack">
-                  <div className="candidate-item">
-                    <div className="candidate-title">State</div>
-                    <div className="timeline-meta">{trip.state}</div>
-                  </div>
-                  <div className="candidate-item">
-                    <div className="candidate-title">Weather mode</div>
-                    <div className="timeline-meta">{trip.weather_mode}</div>
-                  </div>
-                  <div className="candidate-item">
-                    <div className="candidate-title">Latest solver run</div>
-                    <div className="timeline-meta">
-                      {trip.latest_solve
-                        ? `${trip.latest_solve.solve_ms} ms`
-                        : "No run stored yet"}
-                    </div>
-                  </div>
-                </div>
-              </section>
+              <div className="stack">
+                <SolveSummaryBar solve={workspace.latest_accepted_run} label="確定版" />
+                <SolveSummaryBar solve={preview?.solve ?? null} label="プレビュー" />
+                <PlanningMapCanvas candidates={workspace.candidates} solve={preview?.solve ?? workspace.latest_accepted_run} />
+                <TimelineEditor
+                  candidates={workspace.candidates}
+                  orderedPlaceIds={orderedPlaceIds}
+                  solve={preview?.solve ?? workspace.latest_accepted_run}
+                  onReorder={setOrderedPlaceIds}
+                />
+              </div>
+              <div className="stack">
+                <CompareDrawer accepted={workspace.latest_accepted_run} preview={preview?.solve ?? null} />
+                <ExplanationPanel solve={preview?.solve ?? workspace.latest_accepted_run} rules={workspace.rules} />
+              </div>
             </div>
           </>
-        ) : (
-          <section className="panel">
-            <p>Loading trip…</p>
-          </section>
         )}
       </div>
     </main>
