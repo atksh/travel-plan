@@ -32,6 +32,20 @@ def _field_mask(fields: list[str]) -> str:
     return ",".join(fields)
 
 
+def _raise_http_dependency_error(exc: httpx.HTTPError, *, code: str, message: str) -> None:
+    status_code = 502
+    details: dict[str, Any] = {}
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status_code = 502
+        details["upstream_status_code"] = response.status_code
+        try:
+            details["upstream_body"] = response.text[:500]
+        except Exception:
+            pass
+    raise DependencyError(code, message, details=details, status_code=status_code) from exc
+
+
 def _normalize_provider_place(place: dict[str, Any]) -> dict[str, Any]:
     place_id = place.get("id")
     display_name = (place.get("displayName") or {}).get("text")
@@ -86,9 +100,16 @@ async def search_places_text(query: str, region: str = "jp") -> list[dict[str, A
     }
     body = {"textQuery": query, "regionCode": region}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response = await client.post(url, headers=headers, json=body)
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPError as exc:
+            _raise_http_dependency_error(
+                exc,
+                code="GOOGLE_PLACES_TEXT_SEARCH_FAILED",
+                message="Google Places text search failed.",
+            )
     places = payload.get("places")
     if not isinstance(places, list):
         raise DependencyError("GOOGLE_RESPONSE_INVALID", "Places text search payload is invalid.")
@@ -130,9 +151,16 @@ async def search_places_area(
     if included_types:
         body["includedTypes"] = included_types
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response = await client.post(url, headers=headers, json=body)
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPError as exc:
+            _raise_http_dependency_error(
+                exc,
+                code="GOOGLE_PLACES_AREA_SEARCH_FAILED",
+                message="Google Places area search failed.",
+            )
     places = payload.get("places")
     if not isinstance(places, list):
         raise DependencyError("GOOGLE_RESPONSE_INVALID", "Places nearby search payload is invalid.")
@@ -166,13 +194,20 @@ async def get_place_details(
         ),
     }
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(
-            url,
-            headers=headers,
-            params={"languageCode": language_code, "regionCode": region_code},
-        )
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response = await client.get(
+                url,
+                headers=headers,
+                params={"languageCode": language_code, "regionCode": region_code},
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPError as exc:
+            _raise_http_dependency_error(
+                exc,
+                code="GOOGLE_PLACE_DETAILS_FAILED",
+                message="Google Place details lookup failed.",
+            )
     normalized_place = _normalize_provider_place(payload)
     normalized_place["business_status"] = payload.get("businessStatus")
     normalized_place["website_uri"] = payload.get("websiteUri")
@@ -256,9 +291,16 @@ async def compute_route_matrix_minutes(
     if effective_preference != "TRAFFIC_UNAWARE":
         body["departureTime"] = _require_future_departure_time_iso(departure_time_iso)
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        rows = response.json()
+        try:
+            response = await client.post(url, headers=headers, json=body)
+            response.raise_for_status()
+            rows = response.json()
+        except httpx.HTTPError as exc:
+            _raise_http_dependency_error(
+                exc,
+                code="GOOGLE_ROUTE_MATRIX_FAILED",
+                message="Google Routes matrix request failed.",
+            )
     if not isinstance(rows, list):
         raise DependencyError("GOOGLE_RESPONSE_INVALID", "Route matrix payload is invalid.")
     matrix = [[0 for _ in destinations] for _ in origins]
@@ -303,9 +345,16 @@ async def compute_route_polyline(
     if routing_preference != "TRAFFIC_UNAWARE":
         body["departureTime"] = _require_future_departure_time_iso(departure_time_iso)
     async with httpx.AsyncClient(timeout=60.0) as client:
-        response = await client.post(url, headers=headers, json=body)
-        response.raise_for_status()
-        payload = response.json()
+        try:
+            response = await client.post(url, headers=headers, json=body)
+            response.raise_for_status()
+            payload = response.json()
+        except httpx.HTTPError as exc:
+            _raise_http_dependency_error(
+                exc,
+                code="GOOGLE_ROUTE_POLYLINE_FAILED",
+                message="Google Routes polyline request failed.",
+            )
     routes = payload.get("routes")
     if not isinstance(routes, list) or not routes:
         raise DependencyError("GOOGLE_RESPONSE_INVALID", "No routes were returned.")
